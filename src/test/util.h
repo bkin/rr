@@ -6,6 +6,11 @@
 #define _GNU_SOURCE 1
 #define _POSIX_C_SOURCE 2
 
+/* we assume code in assert() is executed.  */
+#ifdef NDEBUG
+#error The rr testsuite requires NDEBUG to be undefined.
+#endif
+
 /* btrfs needs NULL but doesn't #include it */
 #include <stdlib.h>
 /* need to include sys/mount.h before linux/fs.h */
@@ -48,6 +53,7 @@
 #include <pty.h>
 #include <pwd.h>
 #include <sched.h>
+#include <scsi/sg.h>
 #include <signal.h>
 #include <sound/asound.h>
 #include <stdarg.h>
@@ -64,7 +70,6 @@
 #include <sys/ioctl.h>
 #include <sys/ipc.h>
 #include <sys/mman.h>
-#include <sys/mount.h>
 #include <sys/msg.h>
 #include <sys/prctl.h>
 #include <sys/ptrace.h>
@@ -348,6 +353,9 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 #ifndef TIOCGEXCL
 #define TIOCGEXCL _IOR('T', 0x40, int)
 #endif
+#ifndef TIOCGPTPEER
+#define TIOCGPTPEER _IO('T', 0x41)
+#endif
 
 #ifndef MADV_FREE
 #define MADV_FREE 8
@@ -374,6 +382,31 @@ inline static SyscallWrapper get_spurious_desched_syscall(void) {
 #endif
 #ifndef PR_CAP_AMBIENT_CLEAR_ALL
 #define PR_CAP_AMBIENT_CLEAR_ALL 4
+#endif
+
+#ifndef PR_GET_SPECULATION_CTRL
+#define PR_GET_SPECULATION_CTRL 52
+#endif
+#ifndef PR_SET_SPECULATION_CTRL
+#define PR_SET_SPECULATION_CTRL 53
+#endif
+#ifndef PR_SPEC_STORE_BYPASS
+#define PR_SPEC_STORE_BYPASS 0
+#endif
+#ifndef PR_SPEC_NOT_AFFECTED
+#define PR_SPEC_NOT_AFFECTED 0
+#endif
+#ifndef PR_SPEC_PRCTL
+#define PR_SPEC_PRCTL 1
+#endif
+#ifndef PR_SPEC_ENABLE
+#define PR_SPEC_ENABLE 2
+#endif
+#ifndef PR_SPEC_DISABLE
+#define PR_SPEC_DISABLE 4
+#endif
+#ifndef PR_SPEC_FORCE_DISABLE
+#define PR_SPEC_FORCE_DISABLE 8
 #endif
 
 #endif /* RRUTIL_H */

@@ -6,7 +6,11 @@
 #include <capnp/serialize-packed.h>
 #include <inttypes.h>
 #include <limits.h>
+#include <sched.h>
+#include <sys/file.h>
+#include <sys/wait.h>
 #include <sysexits.h>
+#include <dirent.h>
 
 #include <algorithm>
 #include <fstream>
@@ -14,6 +18,7 @@
 #include <string>
 
 #include "AddressSpace.h"
+#include "AutoRemoteSyscalls.h"
 #include "Event.h"
 #include "RecordSession.h"
 #include "RecordTask.h"
@@ -23,6 +28,8 @@
 #include "log.h"
 #include "rr_trace.capnp.h"
 #include "util.h"
+
+#include "rr/rr.h"
 
 using namespace std;
 using namespace capnp;
@@ -105,7 +112,7 @@ static string default_rr_trace_dir() {
   return cached_dir;
 }
 
-static string trace_save_dir() {
+string trace_save_dir() {
   const char* output_dir = getenv("_RR_TRACE_DIR");
   return output_dir ? output_dir : default_rr_trace_dir();
 }
@@ -114,46 +121,27 @@ static string latest_trace_symlink() {
   return trace_save_dir() + "/latest-trace";
 }
 
-static void ensure_dir(const string& dir, mode_t mode) {
-  string d = dir;
-  while (!d.empty() && d[d.length() - 1] == '/') {
-    d = d.substr(0, d.length() - 1);
+string resolve_trace_name(const string& trace_name)
+{
+  if (trace_name.empty()) {
+    return latest_trace_symlink();
   }
 
-  struct stat st;
-  if (0 > stat(d.c_str(), &st)) {
-    if (errno != ENOENT) {
-      FATAL() << "Error accessing trace directory `" << dir << "'";
+  // Single-component paths are looked up first in the current directory, next
+  // in the default trace dir.
+
+  if (trace_name.find('/') == string::npos) {
+    if (dir_exists(trace_name)) {
+      return trace_name;
     }
 
-    size_t last_slash = d.find_last_of('/');
-    if (last_slash == string::npos || last_slash == 0) {
-      FATAL() << "Can't find trace directory `" << dir << "'";
-    }
-    ensure_dir(d.substr(0, last_slash), mode);
-
-    // Allow for a race condition where someone else creates the directory
-    if (0 > mkdir(d.c_str(), mode) && errno != EEXIST) {
-      FATAL() << "Can't create trace directory `" << dir << "'";
-    }
-    if (0 > stat(d.c_str(), &st)) {
-      FATAL() << "Can't stat trace directory `" << dir << "'";
+    string resolved_trace_name = trace_save_dir() + "/" + trace_name;
+    if (dir_exists(resolved_trace_name)) {
+      return resolved_trace_name;
     }
   }
 
-  if (!(S_IFDIR & st.st_mode)) {
-    FATAL() << "`" << dir << "' exists but isn't a directory.";
-  }
-  if (access(d.c_str(), W_OK)) {
-    FATAL() << "Can't write to `" << dir << "'.";
-  }
-}
-
-/**
- * Create the default ~/.rr directory if it doesn't already exist.
- */
-static void ensure_default_rr_trace_dir() {
-  ensure_dir(default_rr_trace_dir(), S_IRWXU);
+  return trace_name;
 }
 
 class CompressedWriterOutputStream : public kj::OutputStream {
@@ -187,13 +175,13 @@ public:
       throw IOException();
     }
   }
-  virtual kj::ArrayPtr<const byte> tryGetReadBuffer() {
+  virtual kj::ArrayPtr<const capnp::byte> tryGetReadBuffer() {
     const uint8_t* p;
     size_t size;
     if (!reader.get_buffer(&p, &size)) {
       throw IOException();
     }
-    return kj::ArrayPtr<const byte>(p, size);
+    return kj::ArrayPtr<const capnp::byte>(p, size);
   }
 
 private:
@@ -201,7 +189,9 @@ private:
 };
 
 TraceStream::TraceStream(const string& trace_dir, FrameTime initial_time)
-    : trace_dir(real_path(trace_dir)), global_time(initial_time) {}
+    : trace_dir(real_path(trace_dir))
+    , global_time(initial_time)
+   {}
 
 string TraceStream::file_data_clone_file_name(const TaskUid& tuid) {
   stringstream ss;
@@ -233,12 +223,12 @@ bool TraceReader::good() const {
   return true;
 }
 
-static kj::ArrayPtr<const byte> str_to_data(const string& str) {
-  return kj::ArrayPtr<const byte>(reinterpret_cast<const byte*>(str.data()),
-                                  str.size());
+static kj::ArrayPtr<const capnp::byte> str_to_data(const string& str) {
+  return kj::ArrayPtr<const capnp::byte>(
+      reinterpret_cast<const capnp::byte*>(str.data()), str.size());
 }
 
-static string data_to_str(const kj::ArrayPtr<const byte>& data) {
+static string data_to_str(const kj::ArrayPtr<const capnp::byte>& data) {
   if (memchr(data.begin(), 0, data.size())) {
     FATAL() << "Invalid string: contains null character";
   }
@@ -355,6 +345,30 @@ static Event from_trace_signal(EventType type, trace::Signal::Reader signal) {
                            from_trace_disposition(signal.getDisposition())));
 }
 
+static trace::TicksSemantics to_trace_ticks_semantics(TicksSemantics semantics) {
+  switch (semantics) {
+    case TICKS_RETIRED_CONDITIONAL_BRANCHES:
+      return trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES;
+    case TICKS_TAKEN_BRANCHES:
+      return trace::TicksSemantics::TAKEN_BRANCHES;
+    default:
+      FATAL() << "Unknown ticks semantics";
+      return trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES;
+  }
+}
+
+static TicksSemantics from_trace_ticks_semantics(trace::TicksSemantics semantics) {
+  switch (semantics) {
+    case trace::TicksSemantics::RETIRED_CONDITIONAL_BRANCHES:
+      return TICKS_RETIRED_CONDITIONAL_BRANCHES;
+    case trace::TicksSemantics::TAKEN_BRANCHES:
+      return TICKS_TAKEN_BRANCHES;
+    default:
+      FATAL() << "Unknown ticks semantics";
+      return TICKS_RETIRED_CONDITIONAL_BRANCHES;
+  }
+}
+
 static pid_t i32_to_tid(int tid) {
   if (tid <= 0) {
     FATAL() << "Invalid tid";
@@ -372,8 +386,8 @@ static int check_fd(int fd) {
 // 8-byte words
 static const size_t reasonable_frame_message_words = 64;
 
-void TraceWriter::write_frame(pid_t tid, SupportedArch arch, const Event& ev,
-                              Ticks tick_count, const Registers* registers,
+void TraceWriter::write_frame(RecordTask* t, const Event& ev,
+                              const Registers* registers,
                               const ExtraRegisters* extra_registers) {
   // Use an on-stack first segment that should be adequate for most cases. A
   // simple syscall event takes 320 bytes currently. The default Capnproto
@@ -383,8 +397,8 @@ void TraceWriter::write_frame(pid_t tid, SupportedArch arch, const Event& ev,
   MallocMessageBuilder frame_msg(buf);
   trace::Frame::Builder frame = frame_msg.initRoot<trace::Frame>();
 
-  frame.setTid(tid);
-  frame.setTicks(tick_count);
+  frame.setTid(t->tid);
+  frame.setTicks(t->tick_count());
   frame.setMonotonicSec(monotonic_now_sec());
   auto mem_writes = frame.initMemWrites(raw_recs.size());
   for (size_t i = 0; i < raw_recs.size(); ++i) {
@@ -395,7 +409,7 @@ void TraceWriter::write_frame(pid_t tid, SupportedArch arch, const Event& ev,
     w.setSize(r.size);
   }
   raw_recs.clear();
-  frame.setArch(to_trace_arch(arch));
+  frame.setArch(to_trace_arch(t->arch()));
   if (registers) {
     // Avoid dynamic allocation and copy
     auto raw_regs = registers->get_ptrace_for_self_arch();
@@ -449,8 +463,9 @@ void TraceWriter::write_frame(pid_t tid, SupportedArch arch, const Event& ev,
       const SyscallEvent& e = ev.Syscall();
       auto syscall = event.initSyscall();
       syscall.setArch(to_trace_arch(e.arch()));
-      syscall.setNumber(e.is_restart ? syscall_number_for_restart_syscall(arch)
-                                     : e.number);
+      syscall.setNumber(e.is_restart
+                            ? syscall_number_for_restart_syscall(t->arch())
+                            : e.number);
       syscall.setState(to_trace_syscall_state(e.state));
       syscall.setFailedDuringPreparation(e.failed_during_preparation);
       auto data = syscall.initExtra();
@@ -466,6 +481,8 @@ void TraceWriter::write_frame(pid_t tid, SupportedArch arch, const Event& ev,
           auto opened = e.opened[i];
           o.setFd(opened.fd);
           o.setPath(str_to_data(opened.path));
+          o.setDevice(opened.device);
+          o.setInode(opened.inode);
         }
       }
       break;
@@ -480,7 +497,7 @@ void TraceWriter::write_frame(pid_t tid, SupportedArch arch, const Event& ev,
     CompressedWriterOutputStream stream(events);
     writePackedMessage(stream, frame_msg);
   } catch (...) {
-    FATAL() << "Unable to write tasks";
+    FATAL() << "Unable to write events";
   }
 
   tick_time();
@@ -500,7 +517,7 @@ TraceFrame TraceReader::read_frame() {
   for (size_t i = 0; i < raw_recs.size(); ++i) {
     // Build list in reverse order so we can efficiently pull records from it
     auto w = mem_writes[raw_recs.size() - 1 - i];
-    raw_recs[i] = { w.getAddr(), w.getSize(), i32_to_tid(w.getTid()) };
+    raw_recs[i] = { w.getAddr(), (size_t)w.getSize(), i32_to_tid(w.getTid()) };
   }
 
   TraceFrame ret;
@@ -510,7 +527,7 @@ TraceFrame TraceReader::read_frame() {
   if (ret.ticks_ < 0) {
     FATAL() << "Invalid ticks value";
   }
-  ret.monotonic_time_ = frame.getMonotonicSec();
+  monotonic_time_ = ret.monotonic_time_ = frame.getMonotonicSec();
 
   SupportedArch arch = from_trace_arch(frame.getArch());
   ret.recorded_regs.set_arch(arch);
@@ -602,8 +619,12 @@ TraceFrame TraceReader::read_frame() {
           auto open = data.getOpenedFds();
           syscall_ev.opened.resize(open.size());
           for (size_t i = 0; i < open.size(); ++i) {
-            syscall_ev.opened[i].fd = check_fd(open[i].getFd());
-            syscall_ev.opened[i].path = data_to_str(open[i].getPath());
+            auto& opened = syscall_ev.opened[i];
+            const auto& o = open[i];
+            opened.fd = check_fd(o.getFd());
+            opened.path = data_to_str(o.getPath());
+            opened.device = o.getDevice();
+            opened.inode = o.getInode();
           }
           break;
         }
@@ -643,6 +664,7 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
       for (size_t i = 0; i < event_cmd_line.size(); ++i) {
         cmd_line.set(i, str_to_data(event_cmd_line[i]));
       }
+      exec.setExeBase(event.exe_base().as_int());
       break;
     }
     case TraceTaskEvent::EXIT:
@@ -662,7 +684,7 @@ void TraceWriter::write_task_event(const TraceTaskEvent& event) {
   }
 }
 
-TraceTaskEvent TraceReader::read_task_event() {
+TraceTaskEvent TraceReader::read_task_event(FrameTime* time) {
   TraceTaskEvent r;
   auto& tasks = reader(TASKS);
   if (tasks.at_end()) {
@@ -673,6 +695,9 @@ TraceTaskEvent TraceReader::read_task_event() {
   PackedMessageReader task_msg(stream);
   trace::TaskEvent::Reader task = task_msg.getRoot<trace::TaskEvent>();
   r.tid_ = i32_to_tid(task.getTid());
+  if (time) {
+    *time = task.getFrameTime();
+  }
   switch (task.which()) {
     case trace::TaskEvent::Which::CLONE: {
       r.type_ = TraceTaskEvent::CLONE;
@@ -680,6 +705,8 @@ TraceTaskEvent TraceReader::read_task_event() {
       r.parent_tid_ = i32_to_tid(clone.getParentTid());
       r.own_ns_tid_ = i32_to_tid(clone.getOwnNsTid());
       r.clone_flags_ = clone.getFlags();
+      LOG(debug) << "Reading event for " << task.getFrameTime()
+                 << ": parent=" << r.parent_tid_ << " tid=" << r.tid_;
       break;
     }
     case trace::TaskEvent::Which::EXEC: {
@@ -691,6 +718,7 @@ TraceTaskEvent TraceReader::read_task_event() {
       for (size_t i = 0; i < cmd_line.size(); ++i) {
         r.cmd_line_[i] = data_to_str(cmd_line[i]);
       }
+      r.exe_base_ = exec.getExeBase();
       break;
     }
     case trace::TaskEvent::Which::EXIT:
@@ -710,7 +738,8 @@ static string base_file_name(const string& file_name) {
                                         : file_name;
 }
 
-string TraceWriter::try_hardlink_file(const string& file_name) {
+bool TraceWriter::try_hardlink_file(const string& file_name,
+                                    std::string* new_name) {
   char count_str[20];
   sprintf(count_str, "%d", mmap_count);
 
@@ -718,10 +747,10 @@ string TraceWriter::try_hardlink_file(const string& file_name) {
       string("mmap_hardlink_") + count_str + "_" + base_file_name(file_name);
   int ret = link(file_name.c_str(), (dir() + "/" + path).c_str());
   if (ret < 0) {
-    // maybe tried to link across filesystems?
-    return file_name;
+    return false;
   }
-  return path;
+  *new_name = path;
+  return true;
 }
 
 bool TraceWriter::try_clone_file(RecordTask* t, const string& file_name,
@@ -757,9 +786,62 @@ bool TraceWriter::try_clone_file(RecordTask* t, const string& file_name,
   return true;
 }
 
+bool TraceWriter::copy_file(const std::string& file_name,
+                            std::string* new_name) {
+  char count_str[20];
+  sprintf(count_str, "%d", mmap_count);
+
+  string path =
+      string("mmap_copy_") + count_str + "_" + base_file_name(file_name);
+
+  ScopedFd src(file_name.c_str(), O_RDONLY);
+  if (!src.is_open()) {
+    LOG(debug) << "Can't open " << file_name;
+    return false;
+  }
+  string dest_path = dir() + "/" + path;
+  ScopedFd dest(dest_path.c_str(), O_WRONLY | O_CREAT | O_EXCL, 0700);
+  if (!dest.is_open()) {
+    return false;
+  }
+
+  *new_name = path;
+
+  return rr::copy_file(dest, src);
+}
+
+/**
+ * Given `file_name`, where `file_name` is relative to our root directory
+ * but is in the mount namespace of `t`, try to make it a file we can read.
+ */
+static string try_make_process_file_name(RecordTask* t,
+                                         const std::string& file_name) {
+  char proc_root[32];
+  // /proc/<pid>/root has magical properties; not only is it a link, but
+  // it links to a view of the filesystem as the process sees it, taking into
+  // account the process mount namespace etc.
+  snprintf(proc_root, sizeof(proc_root), "/proc/%d/root", t->tid);
+  char root[PATH_MAX];
+  ssize_t ret = readlink(proc_root, root, sizeof(root) - 1);
+  ASSERT(t, ret >= 0);
+  root[ret] = 0;
+
+  if (strncmp(root, file_name.c_str(), ret)) {
+    LOG(debug) << "File " << file_name << " is outside known root "
+               << proc_root;
+    return file_name;
+  }
+  return string(proc_root) + (ret == 1 ? file_name : file_name.substr(ret));
+}
+
+static bool starts_with(const string& s, const string& with) {
+  return s.find(with) == 0;
+}
+
 TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
     RecordTask* t, const KernelMapping& km, const struct stat& stat,
-    MappingOrigin origin) {
+    const vector<TraceRemoteFd>& extra_fds, MappingOrigin origin,
+    bool skip_monitoring_mapped_fd) {
   MallocMessageBuilder map_msg;
   trace::MMap::Builder map = map_msg.initRoot<trace::MMap>();
   map.setFrameTime(global_time);
@@ -776,39 +858,75 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
   map.setStatGid(stat.st_gid);
   map.setStatSize(stat.st_size);
   map.setStatMTime(stat.st_mtime);
+  auto fds = map.initExtraFds(extra_fds.size());
+  for (size_t i = 0; i < extra_fds.size(); ++i) {
+    auto e = fds[i];
+    auto& r = extra_fds[i];
+    e.setTid(r.tid);
+    e.setFd(r.fd);
+  }
+  map.setSkipMonitoringMappedFd(skip_monitoring_mapped_fd);
   auto src = map.getSource();
   string backing_file_name;
 
-  if (origin == REMAP_MAPPING || origin == PATCH_MAPPING) {
+  if (origin == REMAP_MAPPING || origin == PATCH_MAPPING ||
+      origin == RR_BUFFER_MAPPING) {
     src.setZero();
-  } else if (km.fsname().find("/SYSV") == 0) {
+  } else if (starts_with(km.fsname(), "/SYSV")) {
     src.setTrace();
   } else if (origin == SYSCALL_MAPPING &&
              (km.inode() == 0 || km.fsname() == "/dev/zero (deleted)")) {
     src.setZero();
-  } else if (origin == RR_BUFFER_MAPPING) {
-    src.setZero();
-  } else if ((km.flags() & MAP_PRIVATE) &&
-             try_clone_file(t, km.fsname(), &backing_file_name)) {
-    src.initFile().setBackingFileName(str_to_data(backing_file_name));
-  } else if (should_copy_mmap_region(km, stat) &&
-             files_assumed_immutable.find(make_pair(
-                 stat.st_dev, stat.st_ino)) == files_assumed_immutable.end()) {
+  } else if (!starts_with(km.fsname(), "/")) {
     src.setTrace();
   } else {
-    // should_copy_mmap_region's heuristics determined it was OK to just map
-    // the file here even if it's MAP_SHARED. So try cloning again to avoid
-    // the possibility of the file changing between recording and replay.
-    if (!try_clone_file(t, km.fsname(), &backing_file_name)) {
-      // Try hardlinking file into the trace directory. This will avoid
-      // replay failures if the original file is deleted or replaced (but not
-      // if it is overwritten in-place). If try_hardlink_file fails it
-      // just returns the original file name.
-      // A relative backing_file_name is relative to the trace directory.
-      backing_file_name = try_hardlink_file(km.fsname());
-      files_assumed_immutable.insert(make_pair(stat.st_dev, stat.st_ino));
+    string file_name = try_make_process_file_name(t, km.fsname());
+    auto assumed_immutable =
+        files_assumed_immutable.find(make_pair(stat.st_dev, stat.st_ino));
+
+    if (assumed_immutable != files_assumed_immutable.end()) {
+      src.initFile().setBackingFileName(str_to_data(assumed_immutable->second));
+    } else if ((km.flags() & MAP_PRIVATE) &&
+               try_clone_file(t, file_name, &backing_file_name)) {
+      src.initFile().setBackingFileName(str_to_data(backing_file_name));
+    } else if (should_copy_mmap_region(km, stat)) {
+      // Make executable files accessible to debuggers by copying the whole
+      // thing into the trace directory. We don't get to compress the data and
+      // the entire file is copied, not just the used region, which is why we
+      // don't do this for all files.
+      // Don't bother trying to copy [vdso].
+      // Don't try to copy files that use shared mappings. We do not want to
+      // create a shared mapping of a file stored in the trace. This means
+      // debuggers can't find the file, but the Linux loader doesn't create
+      // shared mappings so situations where a shared-mapped executable contains
+      // usable debug info should be very rare at best...
+      if ((km.prot() & PROT_EXEC) &&
+          copy_file(file_name, &backing_file_name) &&
+          !(km.flags() & MAP_SHARED)) {
+        src.initFile().setBackingFileName(str_to_data(backing_file_name));
+      } else {
+        src.setTrace();
+      }
+    } else {
+      // should_copy_mmap_region's heuristics determined it was OK to just map
+      // the file here even if it's MAP_SHARED. So try cloning again to avoid
+      // the possibility of the file changing between recording and replay.
+      if (!try_clone_file(t, file_name, &backing_file_name)) {
+        // Try hardlinking file into the trace directory. This will avoid
+        // replay failures if the original file is deleted or replaced (but not
+        // if it is overwritten in-place). If try_hardlink_file fails it
+        // just returns the original file name.
+        // A relative backing_file_name is relative to the trace directory.
+        if (!try_hardlink_file(file_name, &backing_file_name)) {
+          // Don't ever use `file_name` for the `backing_file_name` because it
+          // contains the pid of a recorded process and will not work!
+          backing_file_name = km.fsname();
+        }
+        files_assumed_immutable.insert(
+            make_pair(make_pair(stat.st_dev, stat.st_ino), backing_file_name));
+      }
+      src.initFile().setBackingFileName(str_to_data(backing_file_name));
     }
-    src.initFile().setBackingFileName(str_to_data(backing_file_name));
   }
 
   try {
@@ -824,7 +942,8 @@ TraceWriter::RecordInTrace TraceWriter::write_mapped_region(
 }
 
 void TraceWriter::write_mapped_region_to_alternative_stream(
-    CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km) {
+    CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km,
+    const vector<TraceRemoteFd>& extra_fds, bool skip_monitoring_mapped_fd) {
   MallocMessageBuilder map_msg;
   trace::MMap::Builder map = map_msg.initRoot<trace::MMap>();
 
@@ -838,6 +957,14 @@ void TraceWriter::write_mapped_region_to_alternative_stream(
   map.setFlags(km.flags());
   map.setFileOffsetBytes(km.file_offset_bytes());
   map.setStatSize(data.file_size_bytes);
+  auto fds = map.initExtraFds(extra_fds.size());
+  for (size_t i = 0; i < extra_fds.size(); ++i) {
+    auto e = fds[i];
+    auto& r = extra_fds[i];
+    e.setTid(r.tid);
+    e.setFd(r.fd);
+  }
+  map.setSkipMonitoringMappedFd(skip_monitoring_mapped_fd);
   auto src = map.getSource();
   switch (data.source) {
     case TraceReader::SOURCE_ZERO:
@@ -864,7 +991,9 @@ void TraceWriter::write_mapped_region_to_alternative_stream(
 
 KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
                                               ValidateSourceFile validate,
-                                              TimeConstraint time_constraint) {
+                                              TimeConstraint time_constraint,
+                                              vector<TraceRemoteFd>* extra_fds,
+                                              bool* skip_monitoring_mapped_fd) {
   if (found) {
     *found = false;
   }
@@ -895,6 +1024,16 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
     }
     data->data_offset_bytes = 0;
     data->file_size_bytes = map.getStatSize();
+    if (extra_fds) {
+      const auto& fds = map.getExtraFds();
+      for (size_t i = 0; i < fds.size(); ++i) {
+        const auto& f = fds[i];
+        extra_fds->push_back({ f.getTid(), f.getFd() });
+      }
+    }
+    if (skip_monitoring_mapped_fd) {
+      *skip_monitoring_mapped_fd = map.getSkipMonitoringMappedFd();
+    }
     auto src = map.getSource();
     switch (src.which()) {
       case trace::MMap::Source::Which::ZERO:
@@ -905,11 +1044,10 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
         break;
       case trace::MMap::Source::Which::FILE: {
         data->source = SOURCE_FILE;
-        static const string clone_prefix("mmap_clone_");
         string backing_file_name =
             data_to_str(src.getFile().getBackingFileName());
-        bool is_clone =
-            backing_file_name.substr(0, clone_prefix.size()) == clone_prefix;
+        bool is_clone = starts_with(backing_file_name, "mmap_clone_");
+        bool is_copy = starts_with(backing_file_name, "mmap_copy_");
         if (backing_file_name[0] != '/') {
           backing_file_name = dir() + "/" + backing_file_name;
         }
@@ -922,7 +1060,7 @@ KernelMapping TraceReader::read_mapped_region(MappedData* data, bool* found,
           FATAL() << "Invalid statSize";
         }
         bool has_stat_buf = mode != 0 || uid != 0 || gid != 0 || mtime != 0;
-        if (!is_clone && validate == VALIDATE && has_stat_buf) {
+        if (!is_clone && !is_copy && validate == VALIDATE && has_stat_buf) {
           struct stat backing_stat;
           if (stat(backing_file_name.c_str(), &backing_stat)) {
             FATAL() << "Failed to stat " << backing_file_name
@@ -1003,51 +1141,60 @@ bool TraceReader::read_raw_data_metadata_for_frame(RawDataMetadata& d) {
   return true;
 }
 
-void TraceWriter::close() {
-  for (auto& w : writers) {
-    w->close();
+static string make_trace_dir(const string& exe_path, const string& output_trace_dir) {
+  if (!output_trace_dir.empty()) {
+    // save trace dir in given output trace dir with option -o
+    int ret = mkdir(output_trace_dir.c_str(), S_IRWXU | S_IRWXG);
+    if (ret == 0) {
+      return output_trace_dir;
+    }
+    if (EEXIST == errno) {
+      // directory already exists
+      FATAL() << "Directory `" << output_trace_dir << "' already exists.";
+    } else {
+      FATAL() << "Unable to create trace directory `" << output_trace_dir << "'";
+    }
+  } else {
+    // save trace dir set in _RR_TRACE_DIR or in the default trace dir
+    ensure_dir(trace_save_dir(), "trace directory", S_IRWXU);
+
+    // Find a unique trace directory name.
+    int nonce = 0;
+    int ret;
+    string dir;
+    do {
+      stringstream ss;
+      ss << trace_save_dir() << "/" << basename(exe_path.c_str()) << "-"
+         << nonce++;
+      dir = ss.str();
+      ret = mkdir(dir.c_str(), S_IRWXU | S_IRWXG);
+    } while (ret && EEXIST == errno);
+
+    if (ret) {
+      FATAL() << "Unable to create trace directory `" << dir << "'";
+    }
+
+    return dir;
   }
 
-  string incomplete_path = incomplete_version_path();
-  string path = version_path();
-  if (rename(incomplete_path.c_str(), path.c_str()) < 0) {
-    FATAL() << "Unable to create version file " << path;
-  }
-}
-
-static string make_trace_dir(const string& exe_path) {
-  ensure_default_rr_trace_dir();
-
-  // Find a unique trace directory name.
-  int nonce = 0;
-  int ret;
-  string dir;
-  do {
-    stringstream ss;
-    ss << trace_save_dir() << "/" << basename(exe_path.c_str()) << "-"
-       << nonce++;
-    dir = ss.str();
-    ret = mkdir(dir.c_str(), S_IRWXU | S_IRWXG);
-  } while (ret && EEXIST == errno);
-
-  if (ret) {
-    FATAL() << "Unable to create trace directory `" << dir << "'";
-  }
-
-  return dir;
+  return ""; // not reached
 }
 
 #define STR_HELPER(x) #x
 #define STR(x) STR_HELPER(x)
 
-TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
-                         bool has_cpuid_faulting)
-    : TraceStream(make_trace_dir(file_name),
+TraceWriter::TraceWriter(const std::string& file_name,
+                         int bind_to_cpu,
+                         const string& output_trace_dir,
+                         TicksSemantics ticks_semantics_)
+    : TraceStream(make_trace_dir(file_name, output_trace_dir),
                   // Somewhat arbitrarily start the
                   // global time from 1.
                   1),
+      ticks_semantics_(ticks_semantics_),
       mmap_count(0),
-      supports_file_data_cloning_(false) {
+      has_cpuid_faulting_(false) {
+  this->ticks_semantics_ = ticks_semantics_;
   this->bind_to_cpu = bind_to_cpu;
 
   for (Substream s = SUBSTREAM_FIRST; s < SUBSTREAM_COUNT; ++s) {
@@ -1056,35 +1203,18 @@ TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
   }
 
   string ver_path = incomplete_version_path();
-  ScopedFd version_fd(ver_path.c_str(), O_RDWR | O_CREAT, 0600);
+  version_fd = ScopedFd(ver_path.c_str(), O_RDWR | O_CREAT | O_CLOEXEC, 0600);
   if (!version_fd.is_open()) {
     FATAL() << "Unable to create " << ver_path;
   }
-  static const char buf[] = STR(TRACE_VERSION) "\n";
-  if (write(version_fd, buf, sizeof(buf) - 1) != (ssize_t)sizeof(buf) - 1) {
-    FATAL() << "Unable to write " << ver_path;
+  // Take an exclusive lock and hold it until we rename the file at
+  // the end of recording and then close our file descriptor.
+  if (flock(version_fd, LOCK_EX | LOCK_NB) != 0) {
+    FATAL() << "Unable to lock " << ver_path;
   }
-
-  // We are now bound to the selected CPU (if any), so collect CPUID records
-  // (which depend on the bound CPU number).
-  vector<CPUIDRecord> cpuid_records = all_cpuid_records();
-
-  MallocMessageBuilder header_msg;
-  trace::Header::Builder header = header_msg.initRoot<trace::Header>();
-  header.setBindToCpu(bind_to_cpu);
-  header.setHasCpuidFaulting(has_cpuid_faulting);
-  header.setCpuidRecords(
-      Data::Reader(reinterpret_cast<const uint8_t*>(cpuid_records.data()),
-                   cpuid_records.size() * sizeof(CPUIDRecord)));
-  header.setSyscallbufProtocolVersion(SYSCALLBUF_PROTOCOL_VERSION);
-  // Add a random UUID to the trace metadata. This lets tools identify a trace
-  // easily.
-  uint8_t uuid[16];
-  good_random(uuid, sizeof(uuid));
-  header.setUuid(Data::Reader(uuid, sizeof(uuid)));
-  try {
-    writePackedMessageToFd(version_fd, header_msg);
-  } catch (...) {
+  static const char buf[] = STR(TRACE_VERSION) "\n";
+  size_t buf_len = sizeof(buf) - 1;
+  if (write(version_fd, buf, buf_len) != (ssize_t)buf_len) {
     FATAL() << "Unable to write " << ver_path;
   }
 
@@ -1098,11 +1228,7 @@ TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
   btrfs_ioctl_clone_range_args clone_args;
   clone_args.src_fd = version_fd;
   clone_args.src_offset = 0;
-  off_t offset = lseek(version_fd, 0, SEEK_END);
-  if (offset <= 0) {
-    FATAL() << "Unable to lseek " << ver_path;
-  }
-  clone_args.src_length = offset;
+  clone_args.src_length = buf_len;
   clone_args.dest_offset = 0;
   if (ioctl(version_clone_fd, BTRFS_IOC_CLONE_RANGE, &clone_args) == 0) {
     supports_file_data_cloning_ = true;
@@ -1115,6 +1241,63 @@ TraceWriter::TraceWriter(const std::string& file_name, int bind_to_cpu,
   }
 }
 
+void TraceWriter::setup_cpuid_records(bool has_cpuid_faulting,
+                                      const DisableCPUIDFeatures& disable_cpuid_features) {
+  has_cpuid_faulting_ = has_cpuid_faulting;
+  // We are now bound to the selected CPU (if any), so collect CPUID records
+  // (which depend on the bound CPU number).
+  cpuid_records = all_cpuid_records();
+  // Modify the recorded cpuid data only if cpuid faulting is available. If it
+  // is not available, the tracee will see unmodified data and should also see
+  // that in handle_unrecorded_cpuid_fault (which is sourced from this data).
+  if (has_cpuid_faulting) {
+    for (auto& r : cpuid_records) {
+      disable_cpuid_features.amend_cpuid_data(r.eax_in, r.ecx_in, &r.out);
+    }
+  }
+}
+
+void TraceWriter::close(CloseStatus status, const TraceUuid* uuid) {
+  for (auto& w : writers) {
+    w->close();
+  }
+
+  MallocMessageBuilder header_msg;
+  trace::Header::Builder header = header_msg.initRoot<trace::Header>();
+  header.setBindToCpu(this->bind_to_cpu);
+  header.setHasCpuidFaulting(has_cpuid_faulting_);
+  header.setCpuidRecords(
+      Data::Reader(reinterpret_cast<const uint8_t*>(cpuid_records.data()),
+                   cpuid_records.size() * sizeof(CPUIDRecord)));
+  header.setXcr0(xcr0());
+  header.setTicksSemantics(
+    to_trace_ticks_semantics(PerfCounters::default_ticks_semantics()));
+  header.setSyscallbufProtocolVersion(SYSCALLBUF_PROTOCOL_VERSION);
+  header.setPreloadThreadLocalsRecorded(true);
+  // Add a random UUID to the trace metadata. This lets tools identify a trace
+  // easily.
+  if (!uuid) {
+    uint8_t uuid[sizeof(TraceUuid::bytes)];
+    good_random(uuid, sizeof(uuid));
+    header.setUuid(Data::Reader(uuid, sizeof(uuid)));
+  } else {
+    header.setUuid(Data::Reader(uuid->bytes, sizeof(TraceUuid::bytes)));
+  }
+  header.setOk(status == CLOSE_OK);
+  try {
+    writePackedMessageToFd(version_fd, header_msg);
+  } catch (...) {
+    FATAL() << "Unable to write " << incomplete_version_path();
+  }
+
+  string incomplete_path = incomplete_version_path();
+  string path = version_path();
+  if (rename(incomplete_path.c_str(), path.c_str()) < 0) {
+    FATAL() << "Unable to create version file " << path;
+  }
+  version_fd.close();
+}
+
 void TraceWriter::make_latest_trace() {
   string link_name = latest_trace_symlink();
   // Try to update the symlink to |this|.  We only try attempt
@@ -1123,7 +1306,14 @@ void TraceWriter::make_latest_trace() {
   // and it "won".  The link is then valid and points at some
   // very-recent trace, so that's good enough.
   unlink(link_name.c_str());
-  int ret = symlink(trace_dir.c_str(), link_name.c_str());
+  // Link only the trace name, not the full path, so moving a directory full
+  // of traces around doesn't break the latest-trace link.
+  const char* trace_name = trace_dir.c_str();
+  const char* last = strrchr(trace_name, '/');
+  if (last) {
+    trace_name = last + 1;
+  }
+  int ret = symlink(trace_name, link_name.c_str());
   if (ret < 0 && errno != EEXIST) {
     FATAL() << "Failed to update symlink `" << link_name << "' to `"
             << trace_dir << "'.";
@@ -1152,7 +1342,7 @@ void TraceReader::rewind() {
 }
 
 TraceReader::TraceReader(const string& dir)
-    : TraceStream(dir.empty() ? latest_trace_symlink() : dir, 1) {
+    : TraceStream(resolve_trace_name(dir), 1) {
   for (Substream s = SUBSTREAM_FIRST; s < SUBSTREAM_COUNT; ++s) {
     readers[s] = unique_ptr<CompressedReader>(new CompressedReader(path(s)));
   }
@@ -1223,10 +1413,21 @@ TraceReader::TraceReader(const string& dir)
   trace_uses_cpuid_faulting = header.getHasCpuidFaulting();
   Data::Reader cpuid_records_bytes = header.getCpuidRecords();
   size_t len = cpuid_records_bytes.size() / sizeof(CPUIDRecord);
-  DEBUG_ASSERT(cpuid_records_bytes.size() == len * sizeof(CPUIDRecord));
+  if (cpuid_records_bytes.size() != len * sizeof(CPUIDRecord)) {
+    FATAL() << "Invalid CPUID records length";
+  }
   cpuid_records_.resize(len);
   memcpy(cpuid_records_.data(), cpuid_records_bytes.begin(),
          len * sizeof(CPUIDRecord));
+  xcr0_ = header.getXcr0();
+  preload_thread_locals_recorded_ = header.getPreloadThreadLocalsRecorded();
+  ticks_semantics_ = from_trace_ticks_semantics(header.getTicksSemantics());
+  Data::Reader uuid = header.getUuid();
+  uuid_ = unique_ptr<TraceUuid>(new TraceUuid());
+  if (uuid.size() != sizeof(uuid_->bytes)) {
+    FATAL() << "Invalid UUID length";
+  }
+  memcpy(uuid_->bytes, uuid.begin(), sizeof(uuid_->bytes));
 
   // Set the global time at 0, so that when we tick it for the first
   // event, it matches the initial global time at recording, 1.
@@ -1249,6 +1450,8 @@ TraceReader::TraceReader(const TraceReader& other)
   trace_uses_cpuid_faulting = other.trace_uses_cpuid_faulting;
   cpuid_records_ = other.cpuid_records_;
   raw_recs = other.raw_recs;
+  xcr0_ = other.xcr0_;
+  preload_thread_locals_recorded_ = other.preload_thread_locals_recorded_;
 }
 
 TraceReader::~TraceReader() {}
@@ -1267,6 +1470,23 @@ uint64_t TraceReader::compressed_bytes() const {
     total += reader(s).compressed_bytes();
   }
   return total;
+}
+
+uint64_t TraceReader::xcr0() const {
+  if (xcr0_) {
+    return xcr0_;
+  }
+  // All valid XCR0 values have bit 0 (x87) == 1. So this is the default
+  // value for traces that didn't store XCR0. Assume that the OS enabled
+  // all CPU-supported XCR0 bits.
+  const CPUIDRecord* record =
+    find_cpuid_record(cpuid_records_, CPUID_GETXSAVE, 0);
+  if (!record) {
+    // No XSAVE support at all on the recording CPU??? Assume just
+    // x87/SSE enabled.
+    return 3;
+  }
+  return (uint64_t(record->out.edx) << 32) | record->out.eax;
 }
 
 } // namespace rr

@@ -3,7 +3,9 @@
 #include "RecordCommand.h"
 
 #include <linux/capability.h>
+#include <spawn.h>
 #include <sys/prctl.h>
+#include <sys/wait.h>
 #include <sysexits.h>
 
 #include "preload/preload_interface.h"
@@ -13,6 +15,7 @@
 #include "StringVectorToCharArray.h"
 #include "WaitStatus.h"
 #include "core.h"
+#include "git_revision.h"
 #include "kernel_metadata.h"
 #include "log.h"
 #include "main.h"
@@ -31,6 +34,18 @@ RecordCommand RecordCommand::singleton(
     "  -c, --num-cpu-ticks=<NUM>  maximum number of 'CPU ticks' (currently \n"
     "                             retired conditional branches) to allow a \n"
     "                             task to run before interrupting it\n"
+    "  --disable-cpuid-features <CCC>[,<DDD>]\n"
+    "                             Mask out CPUID EAX=1 feature bits\n"
+    "                             <CCC>: Bitmask of bits to clear from ECX\n"
+    "                             <DDD>: Bitmask of bits to clear from EDX\n"
+    "  --disable-cpuid-features-ext <BBB>[,<CCC>[,<DDD>]]\n"
+    "                             Mask out CPUID EAX=7,ECX=0 feature bits\n"
+    "                             <BBB>: Bitmask of bits to clear from EBX\n"
+    "                             <CCC>: Bitmask of bits to clear from ECX\n"
+    "                             <DDD>: Bitmask of bits to clear from EDX\n"
+    "  --disable-cpuid-features-xsave <AAA>\n"
+    "                             Mask out CPUID EAX=0xD,ECX=1 feature bits\n"
+    "                             <AAA>: Bitmask of bits to clear from EAX\n"
     "  -h, --chaos                randomize scheduling decisions to try to \n"
     "                             reproduce bugs\n"
     "  -i, --ignore-signal=<SIG>  block <SIG> from being delivered to \n"
@@ -41,10 +56,20 @@ RecordCommand RecordCommand::singleton(
     "  --no-file-cloning          disable file cloning for mmapped files\n"
     "  --no-read-cloning          disable file-block cloning for syscallbuf\n"
     "                             reads\n"
+    "  --num-cores=N              pretend to have N cores (rr will still\n"
+    "                             only run on a single core). Overrides\n"
+    "                             random setting from --chaos.\n"
+    "  -o, --output-trace-dir<DIR> set the output trace directory.\n"
+    "                             _RR_TRACE_DIR gets ignored.\n"
+    "                             Directory name is given name, not the\n"
+    "                             application name.\n"
     "  -p --print-trace-dir=<NUM> print trace directory followed by a newline\n"
     "                             to given file descriptor\n"
     "  --syscall-buffer-size=<NUM> desired size of syscall buffer in kB.\n"
     "                             Mainly for tests\n"
+    "  --syscall-buffer-sig=<NUM> the signal used for communication with the\n"
+    "                             syscall buffer. SIGPWR by default, unused\n"
+    "                             if --no-syscall-buffer is passed\n"
     "  -s, --always-switch        try to context switch at every rr event\n"
     "  -t, --continue-through-signal=<SIG>\n"
     "                             Unhandled <SIG> signals will be ignored\n"
@@ -69,7 +94,9 @@ RecordCommand RecordCommand::singleton(
     "                             (for testing purposes)\n"
     "  --setuid-sudo              If running under sudo, pretend to be the\n"
     "                             user that ran sudo rather than root. This\n"
-    "                             allows recording setuid/setcap binaries.\n");
+    "                             allows recording setuid/setcap binaries.\n"
+    "  --trace-id                 Sets the trace id to the specified id.\n"
+    "  --copy-preload-src         Copy preload sources to trace dir\n");
 
 struct RecordFlags {
   vector<string> extra_env;
@@ -92,7 +119,12 @@ struct RecordFlags {
    */
   size_t syscall_buffer_size;
 
+  /* CPUID features to disable */
+  DisableCPUIDFeatures disable_cpuid_features;
+
   int print_trace_dir;
+
+  string output_trace_dir;
 
   /* Whether to use file-cloning optimization during recording. */
   bool use_file_cloning;
@@ -110,6 +142,9 @@ struct RecordFlags {
   /* Whether to enable chaos mode in the scheduler */
   bool chaos;
 
+  /* Controls number of cores reported to recorded process. */
+  int num_cores;
+
   /* True if we should wait for all processes to exit before finishing
    * recording. */
   bool wait_for_all;
@@ -121,6 +156,14 @@ struct RecordFlags {
 
   bool setuid_sudo;
 
+  unique_ptr<TraceUuid> trace_id;
+
+  /* Copy preload sources to trace dir */
+  bool copy_preload_src;
+
+  /* The signal to use for syscallbuf desched events */
+  int syscallbuf_desched_sig;
+
   RecordFlags()
       : max_ticks(Scheduler::DEFAULT_MAX_TICKS),
         ignore_sig(0),
@@ -128,15 +171,19 @@ struct RecordFlags {
         use_syscall_buffer(RecordSession::ENABLE_SYSCALL_BUF),
         syscall_buffer_size(0),
         print_trace_dir(-1),
+        output_trace_dir(""),
         use_file_cloning(true),
         use_read_cloning(true),
         bind_cpu(BIND_CPU),
         always_switch(false),
         chaos(false),
+        num_cores(0),
         wait_for_all(false),
         ignore_nested(false),
         scarce_fds(false),
-        setuid_sudo(false) {}
+        setuid_sudo(false),
+        copy_preload_src(false),
+        syscallbuf_desched_sig(SYSCALLBUF_DEFAULT_DESCHED_SIGNAL) {}
 };
 
 static void parse_signal_name(ParsedOption& opt) {
@@ -158,6 +205,21 @@ static void parse_signal_name(ParsedOption& opt) {
   }
 }
 
+static vector<uint32_t> parse_feature_bits(ParsedOption& opt) {
+  vector<uint32_t> ret;
+  const char* p = opt.value.c_str();
+  while (*p) {
+    char* endptr;
+    unsigned long long v = strtoull(p, &endptr, 0);
+    if (v > UINT32_MAX || (*endptr && *endptr != ',')) {
+      return vector<uint32_t>();
+    }
+    ret.push_back(v);
+    p = *endptr == ',' ? endptr + 1 : endptr;
+  }
+  return ret;
+}
+
 static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
   if (parse_global_option(args)) {
     return true;
@@ -171,12 +233,20 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     { 4, "scarce-fds", NO_PARAMETER },
     { 5, "setuid-sudo", NO_PARAMETER },
     { 6, "bind-to-cpu", HAS_PARAMETER },
+    { 7, "disable-cpuid-features", HAS_PARAMETER },
+    { 8, "disable-cpuid-features-ext", HAS_PARAMETER },
+    { 9, "disable-cpuid-features-xsave", HAS_PARAMETER },
+    { 10, "num-cores", HAS_PARAMETER },
+    { 11, "trace-id", HAS_PARAMETER },
+    { 12, "copy-preload-src", NO_PARAMETER },
+    { 13, "syscall-buffer-sig", HAS_PARAMETER },
     { 'b', "force-syscall-buffer", NO_PARAMETER },
     { 'c', "num-cpu-ticks", HAS_PARAMETER },
     { 'h', "chaos", NO_PARAMETER },
     { 'i', "ignore-signal", HAS_PARAMETER },
     { 'n', "no-syscall-buffer", NO_PARAMETER },
     { 'p', "print-trace-dir", HAS_PARAMETER },
+    { 'o', "output-trace-dir", HAS_PARAMETER },
     { 's', "always-switch", NO_PARAMETER },
     { 't', "continue-through-signal", HAS_PARAMETER },
     { 'u', "cpu-unbound", NO_PARAMETER },
@@ -219,6 +289,9 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
       }
       flags.print_trace_dir = opt.int_value;
       break;
+    case 'o':
+      flags.output_trace_dir = opt.value;
+      break;
     case 0:
       flags.use_read_cloning = false;
       break;
@@ -241,6 +314,123 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
     case 5:
       flags.setuid_sudo = true;
       break;
+    case 6:
+      if (!opt.verify_valid_int(0, INT32_MAX)) {
+        return false;
+      }
+      flags.bind_cpu = BindCPU(opt.int_value);
+      break;
+    case 7: {
+      vector<uint32_t> bits = parse_feature_bits(opt);
+      if (bits.empty() || bits.size() > 2) {
+        return false;
+      }
+      flags.disable_cpuid_features.features_ecx = bits[0];
+      if (bits.size() > 1) {
+        flags.disable_cpuid_features.features_edx = bits[1];
+      }
+      break;
+    }
+    case 8: {
+      vector<uint32_t> bits = parse_feature_bits(opt);
+      if (bits.empty() || bits.size() > 3) {
+        return false;
+      }
+      flags.disable_cpuid_features.extended_features_ebx = bits[0];
+      if (bits.size() > 1) {
+        flags.disable_cpuid_features.extended_features_ecx = bits[1];
+        if (bits.size() > 2) {
+          flags.disable_cpuid_features.extended_features_edx = bits[2];
+        }
+      }
+      break;
+    }
+    case 9: {
+      vector<uint32_t> bits = parse_feature_bits(opt);
+      if (bits.size() != 1) {
+        return false;
+      }
+      flags.disable_cpuid_features.xsave_features_eax = bits[0];
+      break;
+    }
+    case 10: {
+      if (!opt.verify_valid_int(1, 128)) {
+        return false;
+      }
+      flags.num_cores = opt.int_value;
+      break;
+    }
+    case 11: {
+      const uint8_t SUM_GROUP_LENS[5] = { 8, 12, 16, 20, 32 };
+      /* Parse UUIDs from string form optionally with hypens */
+      uint8_t digit = 0; // This counts only hex digits (i.e. not hypens)
+      uint8_t group = 0;
+      uint8_t acc = 0;
+      unique_ptr<TraceUuid> buf(new TraceUuid);
+      auto it = opt.value.begin();
+      while (it < opt.value.end()) {
+        auto c = *it;
+
+        if (digit > SUM_GROUP_LENS[4]) {
+          return false;
+        }
+
+        if (digit % 2 == 0) {
+          // First digit of the byte.
+          if ('0' <= c && c <= '9') {
+            acc = c - '0';
+          } else if ('a' <= c && c <= 'f') {
+            acc = c - 'a' + 10;
+          } else if ('A' <= c && c <= 'F') {
+            acc = c - 'A' + 10;
+          } else if (c == '-') {
+            // Group delimiter.
+            if (SUM_GROUP_LENS[group] != digit) {
+              return false;
+            }
+            ++group;
+            ++it;
+            continue;
+          } else {
+            return false;
+          }
+        } else {
+          // Second digit of the byte.
+          acc <<= 4;
+          if ('0' <= c && c <= '9') {
+            acc += c - '0';
+          } else if ('a' <= c && c <= 'f') {
+            acc += c - 'a' + 10;
+          } else if ('A' <= c && c <= 'F') {
+            acc += c - 'A' + 10;
+          } else {
+            return false;
+          }
+
+          buf->bytes[digit / 2] = acc;
+        }
+
+        ++digit;
+        ++it;
+      }
+
+      if (SUM_GROUP_LENS[4] != digit) {
+        return false;
+      }
+
+      flags.trace_id.swap(buf);
+      break;
+    }
+    case 12:
+      flags.copy_preload_src = true;
+      break;
+    case 13:
+      parse_signal_name(opt);
+      if (!opt.verify_valid_int(1, _NSIG - 1)) {
+        return false;
+      }
+      flags.syscallbuf_desched_sig = opt.int_value;
+      break;
     case 's':
       flags.always_switch = true;
       break;
@@ -250,12 +440,6 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
         return false;
       }
       flags.continue_through_sig = opt.int_value;
-      break;
-    case 6:
-      if (!opt.verify_valid_int(0, INT32_MAX)) {
-        return false;
-      }
-      flags.bind_cpu = BindCPU(opt.int_value);
       break;
     case 'u':
       flags.bind_cpu = UNBOUND_CPU;
@@ -274,7 +458,7 @@ static bool parse_record_arg(vector<string>& args, RecordFlags& flags) {
   return true;
 }
 
-static bool term_request;
+static volatile bool term_request;
 
 /**
  * A terminating signal was received.  Set the |term_request| bit to
@@ -282,6 +466,9 @@ static bool term_request;
  *
  * If there's already a term request pending, then assume rr is wedged
  * and abort().
+ *
+ * Note that this is not only called in a signal handler but it could
+ * be called off the main thread.
  */
 static void handle_SIGTERM(__attribute__((unused)) int sig) {
   // Don't use LOG() here because we're in a signal handler. If we do anything
@@ -290,7 +477,7 @@ static void handle_SIGTERM(__attribute__((unused)) int sig) {
     static const char msg[] =
         "Received SIGTERM while an earlier one was pending.  We're "
         "probably wedged.\n";
-    write(STDERR_FILENO, msg, sizeof(msg) - 1);
+    write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
     notifying_abort();
   }
   term_request = true;
@@ -303,7 +490,10 @@ static void install_signal_handlers(void) {
   sigaction(SIGTERM, &sa, nullptr);
 
   sa.sa_handler = SIG_IGN;
+  sigaction(SIGHUP, &sa, nullptr);
   sigaction(SIGINT, &sa, nullptr);
+  sigaction(SIGABRT, &sa, nullptr);
+  sigaction(SIGQUIT, &sa, nullptr);
 }
 
 static void setup_session_from_flags(RecordSession& session,
@@ -311,6 +501,11 @@ static void setup_session_from_flags(RecordSession& session,
   session.scheduler().set_max_ticks(flags.max_ticks);
   session.scheduler().set_always_switch(flags.always_switch);
   session.set_enable_chaos(flags.chaos);
+  if (flags.num_cores) {
+    // Set the number of cores reported, possibly overriding the chaos mode
+    // setting.
+    session.set_num_cores(flags.num_cores);
+  }
   session.set_use_read_cloning(flags.use_read_cloning);
   session.set_use_file_cloning(flags.use_file_cloning);
   session.set_ignore_sig(flags.ignore_sig);
@@ -337,19 +532,68 @@ void force_close_record_session() {
   }
 }
 
+static void copy_preload_sources_to_trace(const string& trace_dir) {
+  string files_dir = trace_dir + "/files.rr";
+  mkdir(files_dir.c_str(), 0700);
+  pid_t pid;
+  string dest_path = files_dir + "/librrpreload.zip";
+  string src_path = resource_path() + "share/rr/src";
+  char zip[] = "zip";
+  char r[] = "-r";
+  char j[] = "-j";
+  char* argv[] = {
+    zip, r, j,
+    const_cast<char*>(dest_path.c_str()),
+    const_cast<char*>(src_path.c_str()),
+    NULL
+  };
+  posix_spawn_file_actions_t actions;
+  posix_spawn_file_actions_init(&actions);
+  posix_spawn_file_actions_addopen(&actions, STDOUT_FILENO, "/dev/null", O_RDONLY, 0);
+  posix_spawn_file_actions_addopen(&actions, STDERR_FILENO, "/dev/null", O_RDONLY, 0);
+  int ret = posix_spawnp(&pid, argv[0], &actions, NULL, argv, environ);
+  if (ret) {
+    FATAL() << "Can't spawn 'zip'";
+  }
+  posix_spawn_file_actions_destroy(&actions);
+  int status;
+  waitpid(pid, &status, 0);
+  LOG(info) << "Got zip status " << WaitStatus(status);
+}
+
+static void save_rr_git_revision(const string& trace_dir) {
+  string files_dir = trace_dir + "/files.rr";
+  mkdir(files_dir.c_str(), 0700);
+  string dest_path = files_dir + "/rr_git_revision";
+  ScopedFd fd(dest_path.c_str(), O_CREAT | O_WRONLY, 0600);
+  ssize_t written = write(fd, GIT_REVISION, sizeof(GIT_REVISION) - 1);
+  if (written != sizeof(GIT_REVISION) - 1) {
+    FATAL() << "Can't write GIT_REVISION";
+  }
+}
+
 static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
   LOG(info) << "Start recording...";
 
   auto session = RecordSession::create(
-      args, flags.extra_env, flags.use_syscall_buffer, flags.bind_cpu);
+      args, flags.extra_env, flags.disable_cpuid_features,
+      flags.use_syscall_buffer, flags.syscallbuf_desched_sig,
+      flags.bind_cpu, flags.output_trace_dir,
+      flags.trace_id.get());
   setup_session_from_flags(*session, flags);
 
   static_session = session.get();
 
   if (flags.print_trace_dir >= 0) {
     const string& dir = session->trace_writer().dir();
-    write(flags.print_trace_dir, dir.c_str(), dir.size());
-    write(flags.print_trace_dir, "\n", 1);
+    write_all(flags.print_trace_dir, dir.c_str(), dir.size());
+    write_all(flags.print_trace_dir, "\n", 1);
+  }
+
+  if (flags.copy_preload_src) {
+    const string& dir = session->trace_writer().dir();
+    copy_preload_sources_to_trace(dir);
+    save_rr_git_revision(dir);
   }
 
   // Install signal handlers after creating the session, to ensure they're not
@@ -370,8 +614,8 @@ static WaitStatus record(const vector<string>& args, const RecordFlags& flags) {
 
   switch (step_result.status) {
     case RecordSession::STEP_CONTINUE:
-      // SIGINT or something like that interrupted us.
-      return WaitStatus::for_fatal_sig(SIGINT);
+      // SIGTERM interrupted us.
+      return WaitStatus::for_fatal_sig(SIGTERM);
 
     case RecordSession::STEP_EXITED:
       return step_result.exit_status;
@@ -469,6 +713,17 @@ int RecordCommand::run(vector<string>& args) {
     }
 
     reset_uid_sudo();
+  }
+
+  if (flags.chaos) {
+    // Add up to one page worth of random padding to the environment to induce
+    // a variety of possible stack pointer offsets
+    vector<char> chars;
+    chars.resize(random() % page_size());
+    memset(chars.data(), '0', chars.size());
+    chars.push_back(0);
+    string padding = string("RR_CHAOS_PADDING=") + chars.data();
+    flags.extra_env.push_back(padding);
   }
 
   WaitStatus status = record(args, flags);

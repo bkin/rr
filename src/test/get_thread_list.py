@@ -26,14 +26,14 @@ stopped_locations = {
                     '0x0*70000002 in \?\?'],
 }
 
-for i in xrange(NUM_THREADS + 1, 1, -1):
+for i in range(NUM_THREADS + 1, 1, -1):
     # The threads are at the kernel syscall entry, or either the
     # traced/untraced entry reached through the rr monkeypatched one.
     # Rarely, non-main threads have been observed to be reordered (i.e. gdb
     # did not number them in order of creation). This does not seem to be a bug
     # so tolerate it.
     send_gdb('info threads')
-    expect_gdb(r'%d\s+Thread[^(]+\(BP-THREAD-[0-9]+\) (?:%s)'%
+    expect_gdb(r'%d\s+Thread[^(]+\(BP-THREAD-[0-9]+\)\s+(?:%s)'%
                (i, '|'.join(stopped_locations[arch])))
     expect_gdb(r'\(rr\)')
 

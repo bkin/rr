@@ -207,7 +207,7 @@ public:
    * Returns true if the next step for this session is to exit a syscall with
    * the given number.
    */
-  bool next_step_is_syscall_exit(int syscallno);
+  bool next_step_is_successful_syscall_exit(int syscallno);
 
   /**
    * The current ReplayStepKey.
@@ -220,11 +220,22 @@ public:
     return ticks_at_start_of_event;
   }
 
+  struct Flags {
+    Flags()
+      : redirect_stdio(false)
+      , share_private_mappings(false)
+      , cpu_unbound(false) {}
+    Flags(const Flags& other) = default;
+    bool redirect_stdio;
+    bool share_private_mappings;
+    bool cpu_unbound;
+  };
+
   /**
    * Create a replay session that will use the trace directory specified
    * by 'dir', or the latest trace if 'dir' is not supplied.
    */
-  static shr_ptr create(const std::string& dir);
+  static shr_ptr create(const std::string& dir, const Flags& flags);
 
   struct StepConstraints {
     explicit StepConstraints(RunCommand command)
@@ -275,16 +286,7 @@ public:
    */
   static bool is_ignored_signal(int sig);
 
-  struct Flags {
-    Flags() : redirect_stdio(false), share_private_mappings(false) {}
-    Flags(const Flags& other) = default;
-    bool redirect_stdio;
-    bool share_private_mappings;
-  };
-  bool redirect_stdio() { return flags.redirect_stdio; }
-  bool share_private_mappings() { return flags.share_private_mappings; }
-
-  void set_flags(const Flags& flags) { this->flags = flags; }
+  const Flags& flags() const { return flags_; }
 
   typedef std::set<MemoryRange, MappingComparator> MemoryRanges;
   /**
@@ -293,8 +295,14 @@ public:
    */
   static MemoryRanges always_free_address_space(const TraceReader& reader);
 
+  double get_trace_start_time();
+
+  virtual TraceStream* trace_stream() override { return &trace_in; }
+
+  virtual int cpu_binding(TraceStream& trace) const override;
+
 private:
-  ReplaySession(const std::string& dir);
+  ReplaySession(const std::string& dir, const Flags& flags);
   ReplaySession(const ReplaySession& other);
 
   ReplayTask* revive_task_for_exec();
@@ -312,9 +320,9 @@ private:
                                      const StepConstraints& constraints);
   void check_ticks_consistency(ReplayTask* t, const Event& ev);
   void check_pending_sig(ReplayTask* t);
-  void continue_or_step(ReplayTask* t, const StepConstraints& constraints,
-                        TicksRequest tick_request,
-                        ResumeRequest resume_how = RESUME_SYSEMU);
+  Completion continue_or_step(ReplayTask* t, const StepConstraints& constraints,
+                              TicksRequest tick_request,
+                              ResumeRequest resume_how = RESUME_SYSEMU);
   Completion advance_to_ticks_target(ReplayTask* t,
                                      const StepConstraints& constraints);
   Completion emulate_deterministic_signal(ReplayTask* t, int sig,
@@ -340,8 +348,13 @@ private:
   Ticks ticks_at_start_of_event;
   CPUIDBugDetector cpuid_bug_detector;
   siginfo_t last_siginfo_;
-  Flags flags;
+  Flags flags_;
   bool did_fast_forward;
+
+  // The clock_gettime(CLOCK_MONOTONIC) timestamp of the first trace event, used
+  // during 'replay' to calculate the elapsed time between the first event and
+  // all other recorded events in the timeline during the 'record' phase.
+  double trace_start_time;
 
   std::shared_ptr<AddressSpace> syscall_bp_vm;
   remote_code_ptr syscall_bp_addr;

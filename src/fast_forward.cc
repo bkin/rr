@@ -174,7 +174,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
     // breakpoint must have fired
     return false;
   }
-  if (t->vm()->notify_watchpoint_fired(t->debug_status())) {
+  if (t->vm()->notify_watchpoint_fired(t->debug_status(),
+          t->last_execution_resume())) {
     // watchpoint fired
     return false;
   }
@@ -315,7 +316,8 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
       // Grab debug_status before restoring watchpoints, since the latter
       // clears the debug status
       bool triggered_watchpoint =
-          t->vm()->notify_watchpoint_fired(t->debug_status());
+          t->vm()->notify_watchpoint_fired(t->debug_status(),
+              t->last_execution_resume());
       t->vm()->remove_breakpoint(limit_ip, BKPT_INTERNAL);
       t->vm()->restore_watchpoints();
 
@@ -331,8 +333,9 @@ bool fast_forward_through_instruction(Task* t, ResumeRequest how,
       // instructions that don't modify flags should not terminate too early.
       // We can terminate prematurely when the watchpoint we set relative
       // to DI is triggered by a read via SI.
-      ASSERT(t, decoded.modifies_flags || iterations <= BYTES_COALESCED ||
-                    triggered_watchpoint);
+      ASSERT(t,
+             decoded.modifies_flags || iterations <= BYTES_COALESCED ||
+                 triggered_watchpoint);
 
       if (!triggered_watchpoint) {
         // watchpoint didn't fire. We must have exited the loop early and

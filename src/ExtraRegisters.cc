@@ -24,6 +24,8 @@ static const int st_reg_space = 16;
 static const int xmm_regs_offset = 160;
 static const int xmm_reg_space = 16;
 
+static const int xsave_feature_pkru = 9;
+
 static const uint8_t fxsave_387_ctrl_offsets[] = {
   // The Intel documentation says that the following layout is only valid in
   // 32-bit mode, or when fxsave is executed in 64-bit mode without an
@@ -60,7 +62,7 @@ static bool reg_in_range(GdbRegister regno, GdbRegister low, GdbRegister high,
   return true;
 }
 
-static const int AVX_FEATURE = 2;
+static const int AVX_FEATURE_BIT = 2;
 
 static const size_t xsave_header_offset = 512;
 static const size_t xsave_header_size = 64;
@@ -115,7 +117,7 @@ static RegData xsave_register_data(SupportedArch arch, GdbRegister regno) {
 
   if (reg_in_range(regno, DREG_64_YMM0H, DREG_64_YMM15H, AVX_xsave_offset, 16,
                    16, &result)) {
-    result.xsave_feature_bit = AVX_FEATURE;
+    result.xsave_feature_bit = AVX_FEATURE_BIT;
     return result;
   }
 
@@ -195,7 +197,7 @@ void ExtraRegisters::validate(Task* t) {
     ASSERT(t, data_.size() >= offset + 64);
     offset += 64;
     uint64_t features = xsave_features(data_);
-    if (features & AVX_FEATURE) {
+    if (features & (1 << AVX_FEATURE_BIT)) {
       ASSERT(t, data_.size() >= offset + 256);
     }
   }
@@ -304,6 +306,32 @@ template <typename T> static vector<uint8_t> to_vector(const T& v) {
   return result;
 }
 
+static bool all_zeroes(const uint8_t* data, size_t size) {
+  for (size_t i = 0; i < size; ++i) {
+    if (data[i]) {
+      return false;
+    }
+  }
+  return true;
+}
+
+static uint32_t features_used(const uint8_t* data,
+                              const XSaveLayout& layout) {
+  uint64_t features;
+  memcpy(&features, data + xsave_header_offset, sizeof(features));
+  uint64_t pkru_bit = uint64_t(1) << xsave_feature_pkru;
+  if ((features & pkru_bit) &&
+      xsave_feature_pkru < layout.feature_layouts.size()) {
+    // Check if it's really used
+    const XSaveFeatureLayout& fl = layout.feature_layouts[xsave_feature_pkru];
+    if (uint64_t(fl.offset) + fl.size <= layout.full_size &&
+        all_zeroes(data + fl.offset, fl.size)) {
+      features &= ~pkru_bit;
+    }
+  }
+  return features;
+}
+
 bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
                                      const uint8_t* data, size_t data_size,
                                      const XSaveLayout& layout) {
@@ -340,12 +368,16 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
 
   // Check for unsupported features being used
   if (layout.full_size >= xsave_header_end) {
-    uint64_t features_used;
-    memcpy(&features_used, data + xsave_header_offset, sizeof(features_used));
-    if (features_used & ~native_layout.supported_feature_bits) {
-      LOG(error) << "Unsupported CPU features found: got " << HEX(features_used)
-                 << ", supported: "
-                 << HEX(native_layout.supported_feature_bits);
+    uint64_t features = features_used(data, layout);
+    if (features & ~native_layout.supported_feature_bits) {
+      LOG(error) << "Unsupported CPU features found: got " << HEX(features)
+                 << " (" << xsave_feature_string(features)
+                 << "), supported: "
+                 << HEX(native_layout.supported_feature_bits)
+                 << " ("
+                 << xsave_feature_string(native_layout.supported_feature_bits)
+                 << "); Consider using `rr cpufeatures` and "
+                 << "`rr record --disable-cpuid-features-(ext)`";
       return false;
     }
   }
@@ -363,17 +395,22 @@ bool ExtraRegisters::set_to_raw_data(SupportedArch a, Format format,
     return true;
   }
 
+  uint64_t features = features_used(data, layout);
   // OK, now both our native layout and the input layout are using the full
-  // XSAVE header. Copy the header.
-  memcpy(data_.data() + xsave_header_offset, data + xsave_header_offset,
-         xsave_header_size);
+  // XSAVE header. Copy the header. Make sure to use our updated `features`.
+  memcpy(data_.data() + xsave_header_offset, &features, sizeof(features));
+  memcpy(data_.data() + xsave_header_offset + sizeof(features),
+         data + xsave_header_offset + sizeof(features),
+         xsave_header_size - sizeof(features));
 
   // Now copy each optional and present area into the right place in our struct
-  uint64_t features_present;
-  memcpy(&features_present, data + xsave_header_offset,
-         sizeof(features_present));
   for (size_t i = 2; i < 64; ++i) {
-    if (features_present & (uint64_t(1) << i)) {
+    if (features & (uint64_t(1) << i)) {
+      if (i >= layout.feature_layouts.size()) {
+        LOG(error) << "Invalid feature " << i << " beyond max layout "
+                   << layout.feature_layouts.size();
+        return false;
+      }
       const XSaveFeatureLayout& feature = layout.feature_layouts[i];
       if (uint64_t(feature.offset) + feature.size > layout.full_size) {
         LOG(error) << "Invalid feature region: " << feature.offset << "+"

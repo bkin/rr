@@ -1,8 +1,5 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
-//#define FIRST_INTERESTING_EVENT 10700
-//#define LAST_INTERESTING_EVENT 10900
-
 #include "util.h"
 
 #include <arpa/inet.h>
@@ -17,8 +14,10 @@
 #include <netinet/in.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/resource.h>
 #include <sys/socket.h>
 #include <sys/syscall.h>
+#include <sys/time.h>
 #include <sys/vfs.h>
 #include <unistd.h>
 
@@ -47,6 +46,67 @@ using namespace std;
 
 namespace rr {
 
+template <typename Arch> static remote_ptr<typename Arch::unsigned_word> env_ptr(Task* t) {
+  auto stack_ptr = t->regs().sp().cast<typename Arch::unsigned_word>();
+
+  auto argc = t->read_mem(stack_ptr);
+  stack_ptr += argc + 1;
+
+  // Check final NULL in argv
+  auto null_ptr = t->read_mem(stack_ptr);
+  ASSERT(t, null_ptr == 0);
+  stack_ptr++;
+  return stack_ptr;
+}
+
+template <typename Arch> static vector<uint8_t> read_auxv_arch(Task* t) {
+  auto stack_ptr = env_ptr<Arch>(t);
+
+  // Should now point to envp
+  while (0 != t->read_mem(stack_ptr)) {
+    stack_ptr++;
+  }
+  stack_ptr++;
+  // should now point to ELF Auxiliary Table
+
+  vector<uint8_t> result;
+  while (true) {
+    auto pair_vec = t->read_mem(stack_ptr, 2);
+    stack_ptr += 2;
+    typename Arch::unsigned_word pair[2] = { pair_vec[0], pair_vec[1] };
+    result.resize(result.size() + sizeof(pair));
+    memcpy(result.data() + result.size() - sizeof(pair), pair, sizeof(pair));
+    if (pair[0] == 0) {
+      break;
+    }
+  }
+  return result;
+}
+
+vector<uint8_t> read_auxv(Task* t) {
+  RR_ARCH_FUNCTION(read_auxv_arch, t->arch(), t);
+}
+
+template <typename Arch> static vector<string> read_env_arch(Task* t) {
+  auto stack_ptr = env_ptr<Arch>(t);
+
+  // Should now point to envp
+  vector<string> result;
+  while (true) {
+    auto p = t->read_mem(stack_ptr);
+    stack_ptr++;
+    if (!p) {
+      break;
+    }
+    result.push_back(t->read_c_str(remote_ptr<char>(p)));
+  }
+  return result;
+}
+
+vector<string> read_env(Task* t) {
+  RR_ARCH_FUNCTION(read_env_arch, t->arch(), t);
+}
+
 // FIXME this function assumes that there's only one address space.
 // Should instead only look at the address space of the task in
 // question.
@@ -74,7 +134,7 @@ int clone_flags_to_task_flags(int flags_arg) {
   flags |= (CLONE_CHILD_CLEARTID & flags_arg) ? CLONE_CLEARTID : 0;
   flags |= (CLONE_SETTLS & flags_arg) ? CLONE_SET_TLS : 0;
   flags |= (CLONE_SIGHAND & flags_arg) ? CLONE_SHARE_SIGHANDLERS : 0;
-  flags |= (CLONE_THREAD & flags_arg) ? CLONE_SHARE_TASK_GROUP : 0;
+  flags |= (CLONE_THREAD & flags_arg) ? CLONE_SHARE_THREAD_GROUP : 0;
   flags |= (CLONE_VM & flags_arg) ? CLONE_SHARE_VM : 0;
   flags |= (CLONE_FILES & flags_arg) ? CLONE_SHARE_FILES : 0;
   return flags;
@@ -266,6 +326,27 @@ static uint32_t compute_checksum(void* data, size_t len) {
 static const uint32_t ignored_checksum = 0x98765432;
 static const uint32_t sigbus_checksum = 0x23456789;
 
+static bool is_task_buffer(const AddressSpace& as,
+                           const AddressSpace::Mapping& m) {
+  for (Task* t : as.task_set()) {
+    if (t->syscallbuf_child.cast<void>() == m.map.start() &&
+        t->syscallbuf_size == m.map.size()) {
+      return true;
+    }
+    if (t->scratch_ptr == m.map.start() &&
+        t->scratch_size == (ssize_t)m.map.size()) {
+      return true;
+    }
+  }
+  return false;
+}
+
+struct ParsedChecksumLine {
+  remote_ptr<void> start;
+  remote_ptr<void> end;
+  unsigned int checksum;
+};
+
 /**
  * Either create and store checksums for each segment mapped in |t|'s
  * address space, or validate an existing computed checksum.  Behavior
@@ -295,60 +376,66 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
     t->write_mem(in_replay_flag, (unsigned char)0);
   }
 
-  const AddressSpace& as = *t->vm();
+  AddressSpace& as = *t->vm();
+  vector<ParsedChecksumLine> checksums;
+  if (VALIDATE_CHECKSUMS == mode) {
+    while (true) {
+      char line[1024];
+      if (!fgets(line, sizeof(line), c.checksums_file)) {
+        break;
+      }
+      ParsedChecksumLine parsed;
+      unsigned long rec_start;
+      unsigned long rec_end;
+      int nparsed =
+          sscanf(line, "(%x) %lx-%lx", &parsed.checksum, &rec_start, &rec_end);
+      parsed.start = rec_start;
+      parsed.end = rec_end;
+      ASSERT(t, 3 == nparsed) << "Parsed " << nparsed << " items";
+      checksums.push_back(parsed);
+
+      as.ensure_replay_matches_single_recorded_mapping(t, MemoryRange(parsed.start, parsed.end));
+    }
+  }
+
+  auto checksum_iter = checksums.begin();
   for (auto it = as.maps().begin(); it != as.maps().end(); ++it) {
-    auto m = *it;
+    AddressSpace::Mapping m = *it;
     string raw_map_line = m.map.str();
     uint32_t rec_checksum = 0;
 
     if (VALIDATE_CHECKSUMS == mode) {
-      char line[1024];
-      fgets(line, sizeof(line), c.checksums_file);
-      unsigned long rec_start;
-      unsigned long rec_end;
-      unsigned tmp_checksum;
-      int nparsed =
-          sscanf(line, "(%x) %lx-%lx", &tmp_checksum, &rec_start, &rec_end);
-      rec_checksum = tmp_checksum;
-      remote_ptr<void> rec_start_addr = rec_start;
-      remote_ptr<void> rec_end_addr = rec_end;
-      ASSERT(t, 3 == nparsed) << "Parsed " << nparsed << " items";
-      // If we have artifical SIGBUS regions, those may (if the entire region
-      // was SIGBUS), but need not have existed during recording, so fast
-      // forward to the next real region.
-      while (m.map.start() != rec_start_addr) {
-        ASSERT(t, m.flags & AddressSpace::Mapping::IS_SIGBUS_REGION)
-            << "Segment " << rec_start_addr << "-" << rec_end_addr
-            << " changed to " << m.map << "??";
-        ASSERT(t, it != as.maps().end());
-        m = *(++it);
-        continue;
+      ParsedChecksumLine parsed = *checksum_iter;
+      ++checksum_iter;
+      for (; m.map.start() != parsed.start; m = *(++it)) {
+        if (is_task_buffer(as, m)) {
+          // This region corresponds to a task scratch or syscall buffer. We
+          // tear these down a little later during replay so just skip it for
+          // now.
+          continue;
+        }
+        FATAL() << "Segment " << parsed.start << "-" << parsed.end
+                << " changed to " << m.map << "??";
       }
-      // If the backing file is too short, we cut mappings short, to make sure
-      // have the same behavior as during recording. Tolerate this.
-      ASSERT(t, m.map.end() <= rec_end_addr) << "Segment " << rec_start_addr
-                                             << "-" << rec_end_addr
-                                             << " changed to " << m.map << "??";
-      if (is_start_of_scratch_region(t, rec_start_addr)) {
+      ASSERT(t, m.map.end() == parsed.end)
+          << "Segment " << parsed.start << "-" << parsed.end
+          << " changed to " << m.map << "??";
+      if (is_start_of_scratch_region(t, parsed.start)) {
         /* Replay doesn't touch scratch regions, so
          * their contents are allowed to diverge.
          * Tracees can't observe those segments unless
          * they do something sneaky (or disastrously
          * buggy). */
-        LOG(debug) << "Not validating scratch starting at " << rec_start_addr;
+        LOG(debug) << "Not validating scratch starting at " << parsed.start;
         continue;
       }
-      if (rec_checksum == ignored_checksum) {
+      if (parsed.checksum == ignored_checksum) {
         LOG(debug) << "Checksum not computed during recording";
         continue;
-      } else if (rec_checksum == sigbus_checksum) {
-        // This was a SIGBUS equivalent region. During replay, this is either
-        // an explicit SIGBUS region, indicated by the IS_SIGBUS_REGION flag
-        // if the data came from the trace, or an implicit one (which we will
-        // catch below) if the data came from a cloned file.
-        if (m.flags & AddressSpace::Mapping::IS_SIGBUS_REGION) {
-          continue;
-        }
+      } else if (parsed.checksum == sigbus_checksum) {
+        continue;
+      } else {
+        rec_checksum = parsed.checksum;
       }
     } else {
       if (!checksum_segment_filter(m)) {
@@ -360,24 +447,18 @@ static void iterate_checksums(Task* t, ChecksumMode mode,
 
     vector<uint8_t> mem;
     mem.resize(m.map.size());
+    memset(mem.data(), 0, mem.size());
     ssize_t valid_mem_len =
-        t->read_bytes_fallible(m.map.start(), m.map.size(), mem.data());
+        t->read_bytes_fallible(m.map.start(), mem.size(), mem.data());
+    /* Areas not read are treated as zero. We have to do this because
+       mappings not backed by valid file data are not readable during
+       recording but are read as 0 during replay. */
     if (valid_mem_len < 0) {
       /* It is possible for whole mappings to be beyond the extent of the
        * backing file, in which case read_bytes_fallible will return -1.
-       * During replay this will be a SIGBUS region (or, if the file was cloned,
-       * we will end up here again), so skip it now.
        */
       ASSERT(t, valid_mem_len == -1 && errno == EIO);
-      if (VALIDATE_CHECKSUMS == mode) {
-        ASSERT(t, rec_checksum == sigbus_checksum);
-      } else {
-        fprintf(c.checksums_file, "(%x) %s\n", sigbus_checksum,
-                raw_map_line.c_str());
-      }
-      continue;
     }
-    mem.resize(valid_mem_len);
 
     if (m.flags & AddressSpace::Mapping::IS_SYSCALLBUF) {
       /* The syscallbuf consists of a region that's written
@@ -571,9 +652,15 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
   bool private_mapping = (flags & MAP_PRIVATE);
 
   // TODO: handle mmap'd files that are unlinked during
-  // recording.
+  // recording or otherwise not available.
   if (!has_fs_name(file_name)) {
-    LOG(debug) << "  copying unlinked file";
+    // This includes files inaccessible because the tracee is using a different
+    // mount namespace with its own mounts
+    LOG(debug) << "  copying unlinked/inaccessible file";
+    return true;
+  }
+  if (!S_ISREG(stat.st_mode)) {
+    LOG(debug) << "  copying non-regular-file";
     return true;
   }
   if (is_tmp_file(file_name)) {
@@ -657,9 +744,9 @@ bool should_copy_mmap_region(const KernelMapping& mapping,
   if (!can_write_file) {
     /* mmap'ing another user's (non-system) files?  Highly
      * irregular ... */
-    FATAL() << "Unhandled mmap " << file_name << "(prot:" << HEX(prot)
-            << ((flags & MAP_SHARED) ? ";SHARED" : "")
-            << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
+    LOG(warn) << "Scary mmap " << file_name << "(prot:" << HEX(prot)
+              << ((flags & MAP_SHARED) ? ";SHARED" : "")
+              << "); uid:" << stat.st_uid << " mode:" << stat.st_mode;
   }
   return true;
 }
@@ -668,6 +755,23 @@ void resize_shmem_segment(ScopedFd& fd, uint64_t num_bytes) {
   if (ftruncate(fd, num_bytes)) {
     FATAL() << "Failed to resize shmem to " << num_bytes;
   }
+}
+
+bool xsave_enabled() {
+  CPUIDData features = cpuid(CPUID_GETFEATURES, 0);
+  return (features.ecx & OSXSAVE_FEATURE_FLAG) != 0;
+}
+
+uint64_t xcr0() {
+  if (!xsave_enabled()) {
+    // Assume x87/SSE enabled.
+    return 3;
+  }
+  uint32_t eax, edx;
+  asm volatile("xgetbv"
+               : "=a"(eax), "=d"(edx)
+               : "c"(0));
+  return (uint64_t(edx) << 32) | eax;
 }
 
 CPUIDData cpuid(uint32_t code, uint32_t subrequest) {
@@ -838,6 +942,12 @@ vector<CPUIDRecord> all_cpuid_records() {
   return gather_cpuid_records(UINT32_MAX);
 }
 
+#ifdef SYS_arch_prctl
+#define RR_ARCH_PRCTL(a, b) syscall(SYS_arch_prctl, a, b)
+#else
+#define RR_ARCH_PRCTL(a, b) -1
+#endif
+
 bool cpuid_faulting_works() {
   static bool did_check_cpuid_faulting = false;
   static bool cpuid_faulting_ok = false;
@@ -848,7 +958,7 @@ bool cpuid_faulting_works() {
   did_check_cpuid_faulting = true;
 
   // Test to see if CPUID faulting works.
-  if (syscall(SYS_arch_prctl, ARCH_SET_CPUID, 0) != 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 0) != 0) {
     LOG(debug) << "CPUID faulting not supported by kernel/hardware";
     return false;
   }
@@ -875,10 +985,35 @@ bool cpuid_faulting_works() {
   if (sigaction(SIGSEGV, &old_sa, NULL) < 0) {
     FATAL() << "Can't restore sighandler";
   }
-  if (syscall(SYS_arch_prctl, ARCH_SET_CPUID, 1) < 0) {
+  if (RR_ARCH_PRCTL(ARCH_SET_CPUID, 1) < 0) {
     FATAL() << "Can't restore ARCH_SET_CPUID";
   }
   return cpuid_faulting_ok;
+}
+
+const CPUIDRecord* find_cpuid_record(const vector<CPUIDRecord>& records,
+                                     uint32_t eax, uint32_t ecx) {
+  for (const auto& rec : records) {
+    if (rec.eax_in == eax && (rec.ecx_in == ecx || rec.ecx_in == UINT32_MAX)) {
+      return &rec;
+    }
+  }
+  return nullptr;
+}
+
+bool cpuid_compatible(const vector<CPUIDRecord>& trace_records) {
+  // We could compare all CPUID records but that might be fragile (it's hard to
+  // be sure the values don't change in ways applications don't care about).
+  // Let's just check the microarch for now.
+  auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
+  unsigned int cpu_type = cpuid_data.eax & 0xF0FF0;
+  auto trace_cpuid_data =
+      find_cpuid_record(trace_records, CPUID_GETFEATURES, 0);
+  if (!trace_cpuid_data) {
+    FATAL() << "GETFEATURES missing???";
+  }
+  unsigned int trace_cpu_type = trace_cpuid_data->out.eax & 0xF0FF0;
+  return cpu_type == trace_cpu_type;
 }
 
 template <typename Arch>
@@ -977,9 +1112,13 @@ static string read_exe_dir() {
   return exe_path;
 }
 
-string exe_directory() {
-  static string exe_path = read_exe_dir();
-  return exe_path;
+string resource_path() {
+  string resource_path = Flags::get().resource_path;
+  if (resource_path.empty()) {
+    static string exe_path = read_exe_dir() + "../";
+    return exe_path;
+  }
+  return resource_path;
 }
 
 /**
@@ -1034,6 +1173,11 @@ vector<string> read_proc_status_fields(pid_t tid, const char* name,
   return result;
 }
 
+bool is_zombie_process(pid_t pid) {
+  auto state = read_proc_status_fields(pid, "State");
+  return state.empty() || state[0].empty() || state[0][0] == 'Z';
+}
+
 static bool check_for_pax_kernel() {
   auto results = read_proc_status_fields(getpid(), "PaX");
   return !results.empty();
@@ -1044,25 +1188,19 @@ bool uses_invisible_guard_page() {
   return !is_pax_kernel;
 }
 
-void copy_file(Task* t, int dest_fd, int src_fd) {
-  char buf[1024];
+bool copy_file(int dest_fd, int src_fd) {
+  char buf[32 * 1024];
   while (1) {
     ssize_t bytes_read = read(src_fd, buf, sizeof(buf));
-    ASSERT(t, bytes_read >= 0);
+    if (bytes_read < 0) {
+      return false;
+    }
     if (!bytes_read) {
       break;
     }
-    ssize_t bytes_written = write(dest_fd, buf, bytes_read);
-    ASSERT(t, bytes_written == bytes_read);
+    write_all(dest_fd, buf, bytes_read);
   }
-}
-
-void* xmalloc(size_t size) {
-  void* mem_ptr = malloc(size);
-  if (!mem_ptr) {
-    notifying_abort();
-  }
-  return mem_ptr;
+  return true;
 }
 
 bool has_effective_caps(uint64_t caps) {
@@ -1107,7 +1245,7 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
 
   CPUIDRecord cpuid_data = records[record_index];
   DEBUG_ASSERT(cpuid_data.ecx_in == 0);
-  layout.full_size = cpuid_data.out.ecx;
+  layout.full_size = cpuid_data.out.ebx;
   layout.supported_feature_bits =
       cpuid_data.out.eax | (uint64_t(cpuid_data.out.edx) << 32);
 
@@ -1129,11 +1267,6 @@ XSaveLayout xsave_layout_from_trace(const std::vector<CPUIDRecord> records) {
     }
   }
   return layout;
-}
-
-uint64_t rr_signal_mask() {
-  return signal_bit(PerfCounters::TIME_SLICE_SIGNAL) |
-         signal_bit(SYSCALLBUF_DESCHED_SIGNAL);
 }
 
 ScopedFd open_socket(const char* address, unsigned short* port,
@@ -1194,12 +1327,12 @@ void notifying_abort() {
 
 void dump_rr_stack() {
   static const char msg[] = "=== Start rr backtrace:\n";
-  write(STDERR_FILENO, msg, sizeof(msg) - 1);
+  write_all(STDERR_FILENO, msg, sizeof(msg) - 1);
   void* buffer[1024];
   int count = backtrace(buffer, 1024);
   backtrace_symbols_fd(buffer, count, STDERR_FILENO);
   static const char msg2[] = "=== End rr backtrace\n";
-  write(STDERR_FILENO, msg2, sizeof(msg2) - 1);
+  write_all(STDERR_FILENO, msg2, sizeof(msg2) - 1);
 }
 
 void check_for_leaks() {
@@ -1216,14 +1349,55 @@ void check_for_leaks() {
   }
 }
 
+void ensure_dir(const string& dir, const char* dir_type, mode_t mode) {
+  string d = dir;
+  while (!d.empty() && d[d.length() - 1] == '/') {
+    d = d.substr(0, d.length() - 1);
+  }
+
+  struct stat st;
+  if (0 > stat(d.c_str(), &st)) {
+    if (errno != ENOENT) {
+      FATAL() << "Error accessing " << dir_type << " " << dir << "'";
+    }
+
+    size_t last_slash = d.find_last_of('/');
+    if (last_slash == string::npos || last_slash == 0) {
+      FATAL() << "Can't find directory `" << dir << "'";
+    }
+    ensure_dir(d.substr(0, last_slash), dir_type, mode);
+
+    // Allow for a race condition where someone else creates the directory
+    if (0 > mkdir(d.c_str(), mode) && errno != EEXIST) {
+      FATAL() << "Can't create " << dir_type << " `" << dir << "'";
+    }
+    if (0 > stat(d.c_str(), &st)) {
+      FATAL() << "Can't stat " << dir_type << " `" << dir << "'";
+    }
+  }
+
+  if (!(S_IFDIR & st.st_mode)) {
+    FATAL() << "`" << dir << "' exists but isn't a directory.";
+  }
+  if (access(d.c_str(), W_OK)) {
+    FATAL() << "Can't write to " << dir_type << " `" << dir << "'.";
+  }
+}
+
 const char* tmp_dir() {
   const char* dir = getenv("RR_TMPDIR");
   if (dir) {
+    ensure_dir(string(dir), "temporary file directory (RR_TMPDIR)", S_IRWXU);
     return dir;
   }
   dir = getenv("TMPDIR");
   if (dir) {
+    ensure_dir(string(dir), "temporary file directory (TMPDIR)", S_IRWXU);
     return dir;
+  }
+  // Don't try to create "/tmp", that probably won't work well.
+  if (access("/tmp", W_OK)) {
+    FATAL() << "Can't write to temporary file directory /tmp.";
   }
   return "/tmp";
 }
@@ -1273,33 +1447,40 @@ int get_num_cpus() {
 static const uint8_t rdtsc_insn[] = { 0x0f, 0x31 };
 static const uint8_t rdtscp_insn[] = { 0x0f, 0x01, 0xf9 };
 static const uint8_t cpuid_insn[] = { 0x0f, 0xa2 };
+static const uint8_t int3_insn[] = { 0xcc };
 
-DisabledInsn disabled_insn_at(Task* t, remote_code_ptr ip) {
+TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip) {
   uint8_t insn[sizeof(rdtscp_insn)];
   ssize_t len =
       t->read_bytes_fallible(ip.to_data_ptr<uint8_t>(), sizeof(insn), insn);
   if ((size_t)len >= sizeof(rdtsc_insn) &&
       !memcmp(insn, rdtsc_insn, sizeof(rdtsc_insn))) {
-    return DisabledInsn::RDTSC;
+    return TrappedInstruction::RDTSC;
   }
   if ((size_t)len >= sizeof(rdtscp_insn) &&
       !memcmp(insn, rdtscp_insn, sizeof(rdtscp_insn))) {
-    return DisabledInsn::RDTSCP;
+    return TrappedInstruction::RDTSCP;
   }
   if ((size_t)len >= sizeof(cpuid_insn) &&
       !memcmp(insn, cpuid_insn, sizeof(cpuid_insn))) {
-    return DisabledInsn::CPUID;
+    return TrappedInstruction::CPUID;
   }
-  return DisabledInsn::NONE;
+  if ((size_t)len >= sizeof(int3_insn) &&
+      !memcmp(insn, int3_insn, sizeof(int3_insn))) {
+    return TrappedInstruction::INT3;
+  }
+  return TrappedInstruction::NONE;
 }
 
-size_t disabled_insn_len(DisabledInsn insn) {
-  if (insn == DisabledInsn::RDTSC) {
+size_t trapped_instruction_len(TrappedInstruction insn) {
+  if (insn == TrappedInstruction::RDTSC) {
     return sizeof(rdtsc_insn);
-  } else if (insn == DisabledInsn::RDTSCP) {
+  } else if (insn == TrappedInstruction::RDTSCP) {
     return sizeof(rdtscp_insn);
-  } else if (insn == DisabledInsn::CPUID) {
+  } else if (insn == TrappedInstruction::CPUID) {
     return sizeof(cpuid_insn);
+  } else if (insn == TrappedInstruction::INT3) {
+    return sizeof(int3_insn);
   } else {
     return 0;
   }
@@ -1442,6 +1623,113 @@ uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len) {
     crc = crc32_table[(crc ^ *buf) & 0xff] ^ (crc >> 8);
   }
   return crc;
+}
+
+void write_all(int fd, const void* buf, size_t size) {
+  while (size > 0) {
+    ssize_t ret = ::write(fd, buf, size);
+    if (ret <= 0) {
+      FATAL() << "Can't write " << size << " bytes";
+    }
+    buf = static_cast<const char*>(buf) + ret;
+    size -= ret;
+  }
+}
+
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset) {
+  ssize_t written = 0;
+  while (size > 0) {
+    ssize_t ret = ::pwrite64(fd, buf, size, offset);
+    if (ret <= 0) {
+      if (written > 0) {
+        return written;
+      }
+      return ret;
+    }
+    buf = static_cast<const char*>(buf) + ret;
+    written += ret;
+    size -= ret;
+  }
+  return written;
+}
+
+bool is_directory(const char* path) {
+  struct stat buf;
+  if (stat(path, &buf) < 0) {
+    return false;
+  }
+  return (buf.st_mode & S_IFDIR) != 0;
+}
+
+ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size) {
+  ssize_t ret = 0;
+  while (size) {
+    ssize_t r = pread(fd.get(), buf, size, offset);
+    if (r < 0) {
+      return -1;
+    }
+    if (r == 0) {
+      return ret;
+    }
+    offset += r;
+    ret += r;
+    size -= r;
+    buf = static_cast<uint8_t*>(buf) + r;
+  }
+  return ret;
+}
+
+static struct rlimit initial_fd_limit;
+
+void raise_resource_limits() {
+  if (getrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
+    FATAL() << "Can't get RLIMIT_NOFILE";
+  }
+
+  struct rlimit new_limit = initial_fd_limit;
+  // Try raising fd limit to 65536
+  new_limit.rlim_cur = max<rlim_t>(new_limit.rlim_cur, 65536);
+  if (new_limit.rlim_max != RLIM_INFINITY) {
+    new_limit.rlim_cur = min<rlim_t>(new_limit.rlim_cur, new_limit.rlim_max);
+  }
+  if (new_limit.rlim_cur != initial_fd_limit.rlim_cur) {
+    if (setrlimit(RLIMIT_NOFILE, &new_limit) < 0) {
+      LOG(warn) << "Failed to raise file descriptor limit";
+    }
+  }
+}
+
+void restore_initial_resource_limits() {
+  if (setrlimit(RLIMIT_NOFILE, &initial_fd_limit) < 0) {
+    LOG(warn) << "Failed to reset file descriptor limit";
+  }
+}
+
+template <typename Arch> static size_t word_size_arch() {
+  return sizeof(typename Arch::signed_long);
+}
+
+size_t word_size(SupportedArch arch) {
+  RR_ARCH_FUNCTION(word_size_arch, arch);
+}
+
+string json_escape(const string& str, size_t pos) {
+  string out;
+  for (size_t i = pos; i < str.size(); ++i) {
+    char c = str[i];
+    if (c < 32) {
+      char buf[8];
+      sprintf(buf, "\\u%04x", c);
+      out += buf;
+    } else if (c == '\\') {
+      out += "\\\\";
+    } else if (c == '\"') {
+      out += "\\\"";
+    } else {
+      out += c;
+    }
+  }
+  return out;
 }
 
 } // namespace rr

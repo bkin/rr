@@ -67,10 +67,7 @@ string EmuFile::proc_path() const {
 
 void EmuFile::update(dev_t device, ino_t inode, uint64_t size) {
   DEBUG_ASSERT(device_ == device && inode_ == inode);
-  if (size_ != size) {
-    resize_shmem_segment(file, size);
-  }
-  size_ = size;
+  ensure_size(size);
 }
 
 void EmuFile::ensure_size(uint64_t size) {
@@ -95,7 +92,7 @@ void EmuFile::ensure_size(uint64_t size) {
   string real_name = name.str().substr(0, 255);
 
   ScopedFd fd =
-      open(real_name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0600);
+      open(real_name.c_str(), O_CREAT | O_EXCL | O_RDWR | O_CLOEXEC, 0700);
   if (!fd.is_open()) {
     FATAL() << "Failed to create shmem segment " << real_name;
   }
@@ -138,19 +135,29 @@ EmuFile::shr_ptr EmuFs::clone_file(EmuFile::shr_ptr file) {
   return c;
 }
 
-EmuFile::shr_ptr EmuFs::get_or_create(const KernelMapping& recorded_km,
-                                      uint64_t file_size) {
+EmuFile::shr_ptr EmuFs::get_or_create(const KernelMapping& recorded_km) {
   FileId id(recorded_km);
   auto it = files.find(id);
+  uint64_t min_file_size =
+    recorded_km.file_offset_bytes() + recorded_km.size();
   if (it != files.end()) {
     it->second.lock()->update(recorded_km.device(), recorded_km.inode(),
-                              file_size);
+                              min_file_size);
     return it->second.lock();
   }
   auto vf = EmuFile::create(*this, recorded_km.fsname(), recorded_km.device(),
-                            recorded_km.inode(), file_size);
+                            recorded_km.inode(), min_file_size);
   files[id] = vf;
   return vf;
+}
+
+EmuFile::shr_ptr EmuFs::find(dev_t device, ino_t inode) {
+  FileId id(device, inode);
+  auto it = files.find(id);
+  if (it == files.end()) {
+    return EmuFile::shr_ptr();
+  }
+  return it->second.lock();
 }
 
 void EmuFs::log() const {

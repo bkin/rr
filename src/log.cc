@@ -10,6 +10,7 @@
 #include <sstream>
 #include <unordered_map>
 
+#include "DumpCommand.h"
 #include "Flags.h"
 #include "GdbConnection.h"
 #include "GdbServer.h"
@@ -81,12 +82,25 @@ static LogLevel default_level = LOG_error;
 // C++ libraries have a bug that causes them not to be. _CONSTANT_STATIC should
 // turn this into a compile error rather than a runtime crash for compilers
 // that support the attribute.
+
+// This is the assignment of log levels to module names.
+// Any module name not mentioned here gets the default_log_level.
 _CONSTANT_STATIC unique_ptr<unordered_map<string, LogLevel>> level_map;
-_CONSTANT_STATIC unique_ptr<unordered_map<const char*, LogModule>> log_modules;
-_CONSTANT_STATIC std::unique_ptr<stringstream> logging_stream;
-_CONSTANT_STATIC deque<char>* log_buffer;
-_CONSTANT_STATIC std::ostream* log_file;
+// This is a cache mapping unlimited-lifetime file name pointers (usually
+// derived from __FILE__) to the associated module name and log level.
+// It's OK for this to contain multiple entries for the same string but
+// with different pointers.
+_CONSTANT_STATIC unique_ptr<unordered_map<const void*, LogModule>> log_modules;
+// This collects a single log message.
+_CONSTANT_STATIC unique_ptr<stringstream> logging_stream;
+// When non-null, log messages are accumulated into this buffer.
+_CONSTANT_STATIC unique_ptr<deque<char>> log_buffer;
+// When non-null, log messages are flushed to this file.
+_CONSTANT_STATIC ostream* log_file;
+// Maximum size of `log_buffer`.
 size_t log_buffer_size;
+
+static void flush_log_file() { log_file->flush(); }
 
 static void init_log_globals() {
   if (log_globals_initialized) {
@@ -95,26 +109,32 @@ static void init_log_globals() {
   log_globals_initialized = true;
   level_map = unique_ptr<unordered_map<string, LogLevel>>(
       new unordered_map<string, LogLevel>());
-  log_modules = unique_ptr<unordered_map<const char*, LogModule>>(
-      new unordered_map<const char*, LogModule>());
+  log_modules = unique_ptr<unordered_map<const void*, LogModule>>(
+      new unordered_map<const void*, LogModule>());
   logging_stream = unique_ptr<stringstream>(new stringstream());
 
   const char* buffer = getenv("RR_LOG_BUFFER");
   if (buffer) {
     log_buffer_size = atoi(buffer);
     if (log_buffer_size) {
-      log_buffer = new deque<char>();
+      log_buffer = unique_ptr<deque<char>>(new deque<char>());
       atexit(flush_log_buffer);
     }
   }
 
   const char* filename = getenv("RR_LOG_FILE");
+  ios_base::openmode log_file_open_mode = std::ofstream::out;
+  if (!filename) {
+    filename = getenv("RR_APPEND_LOG_FILE");
+    log_file_open_mode |= std::ofstream::app;
+  }
   if (filename) {
-    auto file = new ofstream(filename);
+    auto file = new ofstream(filename, log_file_open_mode);
     if (!file->good()) {
       delete file;
     } else {
       log_file = file;
+      atexit(flush_log_file);
     }
   }
 
@@ -282,7 +302,7 @@ static void write_prefix(T& stream, LogLevel level, const char* file, int line,
     stream << file << ":" << line << ":";
   }
   stream << function << "()";
-  if (level <= LOG_warn) {
+  if (level <= LOG_warn && err) {
     stream << " errno: " << errno_name(err);
   }
   stream << "] ";
@@ -310,7 +330,7 @@ NewlineTerminatingOstream::NewlineTerminatingOstream(LogLevel level,
 
 NewlineTerminatingOstream::~NewlineTerminatingOstream() {
   if (enabled) {
-    log_stream() << std::endl;
+    log_stream() << endl;
     flush_log_stream();
     if (Flags::get().fatal_errors_and_warnings && level <= LOG_warn) {
       notifying_abort();
@@ -318,14 +338,43 @@ NewlineTerminatingOstream::~NewlineTerminatingOstream() {
   }
 }
 
+CleanFatalOstream::CleanFatalOstream(const char* file, int line,
+                                     const char* function) {
+  errno = 0;
+  write_prefix(*this, LOG_fatal, file, line, function);
+}
+
+CleanFatalOstream::~CleanFatalOstream() {
+  cerr << endl;
+  flush_log_stream();
+  exit(1);
+}
+
 FatalOstream::FatalOstream(const char* file, int line, const char* function) {
   write_prefix(*this, LOG_fatal, file, line, function);
 }
 
 FatalOstream::~FatalOstream() {
-  log_stream() << std::endl;
+  log_stream() << endl;
   flush_log_stream();
   notifying_abort();
+}
+
+static const int LAST_EVENT_COUNT = 20;
+
+static void dump_last_events(const TraceStream& trace) {
+  fputs("Tail of trace dump:\n", stderr);
+
+  DumpFlags flags;
+  flags.dump_syscallbuf = true;
+  flags.dump_recorded_data_metadata = true;
+  flags.dump_mmaps = true;
+  FrameTime end = trace.time();
+  vector<string> specs;
+  char buf[100];
+  sprintf(buf, "%lld-%lld", (long long)(end - LAST_EVENT_COUNT), (long long)(end + 1));
+  specs.push_back(string(buf));
+  dump(trace.dir(), flags, specs, stderr);
 }
 
 static void emergency_debug(Task* t) {
@@ -340,7 +389,11 @@ static void emergency_debug(Task* t) {
 
   RecordSession* record_session = t->session().as_record();
   if (record_session) {
-    record_session->trace_writer().close();
+    record_session->close_trace_writer(TraceWriter::CLOSE_ERROR);
+  }
+  TraceStream* trace_stream = t->session().trace_stream();
+  if (trace_stream) {
+    dump_last_events(*trace_stream);
   }
 
   if (probably_not_interactive() && !Flags::get().force_things &&
@@ -371,7 +424,7 @@ EmergencyDebugOstream::EmergencyDebugOstream(bool cond, const Task* t,
 
 EmergencyDebugOstream::~EmergencyDebugOstream() {
   if (!cond) {
-    log_stream() << std::endl;
+    log_stream() << endl;
     flush_log_stream();
     t->log_pending_events();
     emergency_debug(t);

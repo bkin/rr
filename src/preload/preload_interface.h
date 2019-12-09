@@ -4,7 +4,17 @@
 #define RR_PRELOAD_INTERFACE_H_
 
 /* Bump this whenever the interface between syscallbuf and rr changes in a way
- * that would require changes to replay.
+ * that would require changes to replay. So be very careful making changes to
+ * this file! Many changes would require a bump in this value, and support
+ * code in rr to handle old protocol versions. And when we bump it we'll need
+ * to figure out a way to test the old protocol versions.
+ * To be clear, changes that only affect recording and not replay, such as
+ * changes to the layout of syscall_patch_hook, do not need to bump this.
+ * Note also that SYSCALLBUF_PROTOCOL_VERSION is stored in the trace header, so
+ * replay always has access to the SYSCALLBUF_PROTOCOL_VERSION used during
+ * recording, even before the preload library is ever loaded.
+ *
+ * Version 0: initial rr 5.0.0 release
  */
 #define SYSCALLBUF_PROTOCOL_VERSION 0
 
@@ -85,12 +95,6 @@ static inline const char* extract_file_name(const char* s) {
 #define SYSCALLBUF_LIB_FILENAME_PADDED SYSCALLBUF_LIB_FILENAME_BASE ".so:::"
 #define SYSCALLBUF_LIB_FILENAME_32 SYSCALLBUF_LIB_FILENAME_BASE "_32.so"
 
-/* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
- * power failure, and it's unlikely rr will be recording that.
- * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
- * so we can't use it. */
-#define SYSCALLBUF_DESCHED_SIGNAL SIGPWR
-
 /* Set this env var to enable syscall buffering. */
 #define SYSCALLBUF_ENABLED_ENV_VAR "_RR_USE_SYSCALLBUF"
 
@@ -121,7 +125,7 @@ static inline const char* extract_file_name(const char* s) {
 /* PRELOAD_THREAD_LOCALS_ADDR should not change.
  * Tools depend on this address. */
 #define PRELOAD_THREAD_LOCALS_ADDR (RR_PAGE_ADDR + PAGE_SIZE)
-#define PRELOAD_THREAD_LOCALS_SIZE 88
+#define PRELOAD_THREAD_LOCALS_SIZE 104
 
 /* "Magic" (rr-implemented) syscalls that we use to initialize the
  * syscallbuf.
@@ -174,11 +178,15 @@ static inline const char* extract_file_name(const char* s) {
 #ifdef RR_IMPLEMENT_PRELOAD
 #define TEMPLATE_ARCH
 #define PTR(T) T*
+#define PTR_ARCH(T) T*
 #define VOLATILE volatile
+#define SIGNED_LONG long
 #else
 #define TEMPLATE_ARCH template <typename Arch>
 #define PTR(T) typename Arch::template ptr<T>
+#define PTR_ARCH(T) typename Arch::template ptr<T<Arch>>
 #define VOLATILE
+#define SIGNED_LONG typename Arch::signed_long
 #endif
 
 /**
@@ -191,11 +199,15 @@ static inline const char* extract_file_name(const char* s) {
  * instruction that follows a syscall instruction.
  * Each instance of this struct describes an instruction that can follow a
  * syscall and a hook function to patch with.
+ *
+ * This is not (and must not ever be) used during replay so we can change it
+ * without bumping SYSCALLBUF_PROTOCOL_VERSION.
  */
 struct syscall_patch_hook {
   uint8_t is_multi_instruction;
   uint8_t next_instruction_length;
-  uint8_t next_instruction_bytes[6];
+  /* Avoid any padding or anything that would make the layout arch-specific. */
+  uint8_t next_instruction_bytes[14];
   uint64_t hook_address;
 };
 
@@ -221,6 +233,10 @@ struct mprotect_record {
  * Variables used to communicate between preload and rr.
  * We package these up into a single struct to simplify the preload/rr
  * interface.
+ * You can add to the end of this struct without breaking trace compatibility,
+ * but don't move existing fields. Do not write to it during replay except for
+ * the 'in_replay' field. Be careful reading fields during replay as noted
+ * below, since they don't all exist in all trace versions.
  */
 struct preload_globals {
   /* 0 during recording, 1 during replay. Set by rr.
@@ -235,6 +251,11 @@ struct preload_globals {
   /* 0 during recording and replay, 1 during diversion. Set by rr.
    */
   unsigned char in_diversion;
+  /* 1 if chaos mode is enabled. DO NOT READ from rr during replay, because
+     this field is not initialized in old traces. */
+  unsigned char in_chaos;
+  /* The signal to use for desched events */
+  unsigned char desched_sig;
   /* Number of cores to pretend we have. 0 means 1. rr sets this when
    * the preload library is initialized. */
   int pretend_num_cores;
@@ -245,10 +266,25 @@ struct preload_globals {
    * The rr supervisor modifies this array directly to dynamically turn
    * syscallbuf on and off for particular fds. fds outside the array range must
    * never use the syscallbuf.
+   * The last entry is set if *any* fd >= SYSCALLBUF_FDS_DISABLED_SIZE - 1
+   * has had buffering disabled.
    */
   VOLATILE char syscallbuf_fds_disabled[SYSCALLBUF_FDS_DISABLED_SIZE];
   /* mprotect records. Set by preload. */
   struct mprotect_record mprotect_records[MPROTECT_RECORD_COUNT];
+  /* Random seed that can be used for various purposes. DO NOT READ from rr
+     during replay, because this field does not exist in old traces. */
+  uint64_t random_seed;
+};
+
+/**
+ * Represents syscall params.  Makes it simpler to pass them around,
+ * and avoids pushing/popping all the data for calls.
+ */
+TEMPLATE_ARCH
+struct syscall_info {
+  SIGNED_LONG no;
+  SIGNED_LONG args[6];
 };
 
 /**
@@ -262,23 +298,45 @@ struct preload_globals {
  */
 TEMPLATE_ARCH
 struct preload_thread_locals {
-  /* The offsets of these fields are hardcoded in syscall_hook.S and
-   * assembly_templates.py. Try to avoid changing them! */
-  /* Pointer to alt-stack used by syscallbuf stubs (allocated at the end of
-   * the scratch buffer */
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on.
+   * Offset of this field is hardcoded in syscall_hook.S and
+   * assembly_templates.py.
+   * Pointer to alt-stack used by syscallbuf stubs (allocated at the end of
+   * the scratch buffer.
+   */
   PTR(void) syscallbuf_stub_alt_stack;
-  /* Where syscall result will be (or during replay, has been) saved.
-   * The offset of this field MUST NOT CHANGE, it is part of the preload ABI
-   * tools can depend on. */
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * tools can depend on.
+   * Where syscall result will be (or during replay, has been) saved.
+   */
   PTR(int64_t) pending_untraced_syscall_result;
-  /* scratch space used by stub code */
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on.
+   * Scratch space used by stub code.
+   */
   PTR(void) stub_scratch_1;
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on.
+   */
   int alt_stack_nesting_level;
+  /**
+   * We could use this later.
+   */
+  int unused_padding;
+  /* The offset of this field MUST NOT CHANGE, it is part of the preload ABI
+   * rr depends on. It contains the parameters to the patched syscall, or
+   * zero if we're not processing a buffered syscall. Do not depend on this
+   * existing during replay, some traces with SYSCALLBUF_PROTOCOL_VERSION 0
+   * don't have it.
+   */
+  PTR_ARCH(const struct syscall_info) original_syscall_parameters;
 
   /* Nonzero when thread-local state like the syscallbuf has been
    * initialized.  */
   int thread_inited;
-  /* When buffering is enabled, points at the thread's mapped buffer
+  /* The offset of this field MUST NOT CHANGE, it is part of the ABI tools
+   * depend on. When buffering is enabled, points at the thread's mapped buffer
    * segment.  At the start of the segment is an object of type |struct
    * syscallbuf_hdr|, so |buffer| is also a pointer to the buffer
    * header. */
@@ -322,7 +380,7 @@ struct preload_thread_locals {
   int cloned_file_data_fd;
   off_t cloned_file_data_offset;
   PTR(void) scratch_buf;
-  size_t scratch_size;
+  size_t usable_scratch_size;
 
   PTR(struct msghdr) notify_control_msg;
 };
@@ -373,7 +431,7 @@ struct rrcall_init_buffers_params {
   /* Returned pointer to rr's syscall scratch buffer */
   PTR(void) scratch_buf;
   uint32_t syscallbuf_size;
-  uint32_t scratch_size;
+  uint32_t usable_scratch_size;
 };
 
 /**
@@ -463,7 +521,7 @@ struct syscallbuf_hdr {
    */
   volatile uint8_t in_sigprocmask_critical_section;
   /* Nonzero when the syscall was aborted during preparation without doing
-   * anything */
+   * anything. This is set when a user seccomp filter forces a SIGSYS. */
   volatile uint8_t failed_during_preparation;
 
   struct syscallbuf_record recs[0];
@@ -515,10 +573,15 @@ inline static long stored_record_size(size_t length) {
  * too much by piling on.
  */
 inline static int is_blacklisted_filename(const char* filename) {
-  return strprefix("/dev/dri/", filename) ||
-         streq("/dev/nvidiactl", filename) ||
-         streq("/usr/share/alsa/alsa.conf", filename) ||
-         strprefix("pulse-shm-", extract_file_name(filename));
+  const char* f;
+  if (strprefix("/dev/dri/", filename) || streq("/dev/nvidiactl", filename) ||
+      streq("/usr/share/alsa/alsa.conf", filename) ||
+      streq("/dev/nvidia-uvm", filename)) {
+    return 1;
+  }
+  f = extract_file_name(filename);
+  return strprefix("rr-test-blacklist-file_name", f) ||
+         strprefix("pulse-shm-", f);
 }
 
 inline static int is_blacklisted_memfd(const char* name) {
@@ -564,13 +627,13 @@ inline static int is_proc_fd_dir(const char* filename) {
 /**
  * Returns nonzero if an attempted open() of |filename| can be syscall-buffered.
  * When this returns zero, the open must be forwarded to the rr process.
- * This is imperfect because it doesn't handle symbolic links, hard links,
- * files accessed with non-absolute paths, /proc mounted in differnet places,
- * etc etc etc. Handling those efficiently (no additional syscalls in
- * common cases) is a problem. Maybe we could afford fstat after every open...
+ * |filename| must be absolute.
+ * This is imperfect because it doesn't handle hard links and files (re)mounted
+ * in different places.
  */
 inline static int allow_buffered_open(const char* filename) {
-  return !is_blacklisted_filename(filename) && !is_gcrypt_deny_file(filename) &&
+  return filename &&
+         !is_blacklisted_filename(filename) && !is_gcrypt_deny_file(filename) &&
          !is_terminal(filename) && !is_proc_mem_file(filename) &&
          !is_proc_fd_dir(filename);
 }

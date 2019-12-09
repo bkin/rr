@@ -69,6 +69,7 @@ public:
   virtual void will_resume_execution(ResumeRequest, WaitRequest, TicksRequest,
                                      int /*sig*/) override;
   virtual void did_wait() override;
+  virtual pid_t own_namespace_tid() override { return own_namespace_rec_tid; }
 
   std::vector<remote_code_ptr> syscallbuf_syscall_entry_breakpoints();
   bool is_at_syscallbuf_syscall_entry_breakpoint();
@@ -258,7 +259,7 @@ public:
   void stash_synthetic_sig(const siginfo_t& si,
                            SignalDeterministic deterministic);
   bool has_stashed_sig() const { return !stashed_signals.empty(); }
-  bool has_stashed_sig_not_synthetic_SIGCHLD() const;
+  const siginfo_t* stashed_sig_not_synthetic_SIGCHLD() const;
   bool has_stashed_sig(int sig) const;
   struct StashedSignal {
     StashedSignal(const siginfo_t& siginfo, SignalDeterministic deterministic)
@@ -269,6 +270,14 @@ public:
   const StashedSignal* peek_stashed_sig_to_deliver() const;
   void pop_stash_sig(const StashedSignal* stashed);
   void stashed_signal_processed();
+
+  /**
+   * If a group-stop occurs at an inconvenient time, stash it and
+   * process it later.
+   */
+  void stash_group_stop() { stashed_group_stop = true; }
+  void clear_stashed_group_stop() { stashed_group_stop = false; }
+  bool has_stashed_group_stop() const { return stashed_group_stop; }
 
   /**
    * Return true if the current state of this looks like the
@@ -348,8 +357,12 @@ public:
   void record_remote(const MemoryRange& range) {
     record_remote(range.start(), range.size());
   }
-  // Record as much as we can of the bytes in this range.
-  void record_remote_fallible(remote_ptr<void> addr, ssize_t num_bytes);
+  // Record as much as we can of the bytes in this range. Will record only
+  // contiguous mapped data starting at `addr`.
+  ssize_t record_remote_fallible(remote_ptr<void> addr, ssize_t num_bytes);
+  // Record as much as we can of the bytes in this range. Will record only
+  // contiguous mapped-writable data starting at `addr`.
+  void record_remote_writable(remote_ptr<void> addr, ssize_t num_bytes);
 
   // Simple helper that attempts to use the local mapping to record if one
   // exists
@@ -422,7 +435,15 @@ public:
      */
     DONT_FLUSH_SYSCALLBUF
   };
+  enum AllowSyscallbufReset {
+    ALLOW_RESET_SYSCALLBUF,
+    /* Pass this if it's safe to replay the event before we process the
+     * syscallbuf records.
+     */
+    DONT_RESET_SYSCALLBUF
+  };
   void record_event(const Event& ev, FlushSyscallbuf flush = FLUSH_SYSCALLBUF,
+                    AllowSyscallbufReset reset = ALLOW_RESET_SYSCALLBUF,
                     const Registers* registers = nullptr);
 
   bool is_fatal_signal(int sig, SignalDeterministic deterministic) const;
@@ -479,10 +500,7 @@ public:
    * where they can: when a non-main-thread does an execve, its tid changes
    * to the tid of the thread-group leader.
    */
-  void set_tid_and_update_serial(pid_t tid);
-
-  /* Retrieve the tid of this task from the tracee and store it */
-  void update_own_namespace_tid();
+  void set_tid_and_update_serial(pid_t tid, pid_t own_namespace_tid);
 
   /**
    * Return our cached copy of the signal mask, updating it if necessary.
@@ -493,8 +511,13 @@ public:
    */
   sig_set_t read_sigmask_from_process();
 
-private:
   ~RecordTask();
+
+  void maybe_restore_original_syscall_registers();
+
+private:
+  /* Retrieve the tid of this task from the tracee and store it */
+  void update_own_namespace_tid();
 
   /**
    * Wait for |futex| in this address space to have the value
@@ -537,7 +560,11 @@ private:
   /** Update the clear-tid futex to |tid_addr|. */
   void set_tid_addr(remote_ptr<int> tid_addr);
 
+  virtual bool post_vm_clone(CloneReason reason, int flags, Task* origin) override;
+
 public:
+  Ticks ticks_at_last_recorded_syscall_exit;
+
   // Scheduler state
 
   Registers registers_at_start_of_last_timeslice;
@@ -658,9 +685,16 @@ public:
   // next opportunity.
   std::deque<StashedSignal> stashed_signals;
   bool stashed_signals_blocking_more_signals;
+  bool stashed_group_stop;
   bool break_at_syscallbuf_traced_syscalls;
   bool break_at_syscallbuf_untraced_syscalls;
   bool break_at_syscallbuf_final_instruction;
+
+  // The pmc is programmed to interrupt at a value requested by the tracee, not
+  // by rr.
+  bool next_pmc_interrupt_is_for_user;
+
+  bool did_record_robust_futex_changes;
 };
 
 } // namespace rr

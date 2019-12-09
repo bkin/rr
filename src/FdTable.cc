@@ -19,10 +19,14 @@ using namespace std;
 
 namespace rr {
 
-void FdTable::add_monitor(int fd, FileMonitor* monitor) {
+void FdTable::add_monitor(Task* t, int fd, FileMonitor* monitor) {
   // In the future we could support multiple monitors on an fd, but we don't
   // need to yet.
-  DEBUG_ASSERT(!is_monitoring(fd));
+  ASSERT(t, !is_monitoring(fd)) << "Task " << t->rec_tid
+    << " already monitoring fd " << fd;
+  if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(fd) == 0) {
+    fd_count_beyond_limit++;
+  }
   fds[fd] = FileMonitor::shr_ptr(monitor);
   update_syscallbuf_fds_disabled(fd);
 }
@@ -88,8 +92,14 @@ void FdTable::did_write(Task* t, int fd,
 
 void FdTable::did_dup(int from, int to) {
   if (fds.count(from)) {
+    if (to >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(to) == 0) {
+      fd_count_beyond_limit++;
+    }
     fds[to] = fds[from];
   } else {
+    if (to >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(to) > 0) {
+      fd_count_beyond_limit--;
+    }
     fds.erase(to);
   }
   update_syscallbuf_fds_disabled(to);
@@ -97,6 +107,9 @@ void FdTable::did_dup(int from, int to) {
 
 void FdTable::did_close(int fd) {
   LOG(debug) << "Close fd " << fd;
+  if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE && fds.count(fd) > 0) {
+    fd_count_beyond_limit--;
+  }
   fds.erase(fd);
   update_syscallbuf_fds_disabled(fd);
 }
@@ -104,14 +117,17 @@ void FdTable::did_close(int fd) {
 FileMonitor* FdTable::get_monitor(int fd) {
   auto it = fds.find(fd);
   if (it == fds.end()) {
-    return NULL;
+    return nullptr;
   }
   return it->second.get();
 }
 
 static bool is_fd_monitored_in_any_task(AddressSpace* vm, int fd) {
   for (Task* t : vm->task_set()) {
-    if (t->fd_table()->is_monitoring(fd)) {
+    auto table = t->fd_table();
+    if (table->is_monitoring(fd) ||
+        (fd >= SYSCALLBUF_FDS_DISABLED_SIZE - 1 &&
+         table->count_beyond_limit() > 0)) {
       return true;
     }
   }
@@ -137,7 +153,10 @@ void FdTable::update_syscallbuf_fds_disabled(int fd) {
     }
     vms_updated.insert(vm);
 
-    if (!rt->preload_globals.is_null() && fd < SYSCALLBUF_FDS_DISABLED_SIZE) {
+    if (!rt->preload_globals.is_null()) {
+      if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE) {
+        fd = SYSCALLBUF_FDS_DISABLED_SIZE - 1;
+      }
       char disable = (char)is_fd_monitored_in_any_task(vm, fd);
       auto addr =
           REMOTE_PTR_FIELD(t->preload_globals, syscallbuf_fds_disabled[0]) + fd;
@@ -169,9 +188,10 @@ void FdTable::init_syscallbuf_fds_disabled(Task* t) {
     for (auto& it : vm_t->fd_table()->fds) {
       int fd = it.first;
       DEBUG_ASSERT(fd >= 0);
-      if (fd < SYSCALLBUF_FDS_DISABLED_SIZE) {
-        disabled[fd] = 1;
+      if (fd >= SYSCALLBUF_FDS_DISABLED_SIZE) {
+        fd = SYSCALLBUF_FDS_DISABLED_SIZE - 1;
       }
+      disabled[fd] = 1;
     }
   }
 

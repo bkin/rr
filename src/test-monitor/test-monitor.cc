@@ -1,4 +1,5 @@
 #include <dirent.h>
+#include <errno.h>
 #include <limits.h>
 #include <signal.h>
 #include <stdint.h>
@@ -9,6 +10,7 @@
 #include <sys/wait.h>
 #include <unistd.h>
 
+#include <string>
 #include <unordered_map>
 #include <unordered_set>
 #include <vector>
@@ -307,6 +309,8 @@ int main(int argc, char* argv[]) {
     if (child > 0) {
       break;
     }
+    /* Put the child in its own process group */
+    setpgid(0, 0);
     char buf[1024];
     sprintf(buf, "%d", getppid());
     setenv("RUNNING_UNDER_TEST_MONITOR", buf, 1);

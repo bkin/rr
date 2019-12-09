@@ -160,6 +160,13 @@ private:
   // The kernel's name for the mapping, as per /proc/<pid>/maps. This must
   // be exactly correct.
   const std::string fsname_;
+  // Note that btrfs has weird behavior and /proc/.../maps can show a different
+  // device number to the device from stat()ing the file that was mapped.
+  // https://www.mail-archive.com/linux-btrfs@vger.kernel.org/msg57667.html
+  // We store here the device number obtained from fstat()ing the file.
+  // This also seems to be consistent with what we read from populate_address_space
+  // for the initial post-exec mappings. It is NOT consistent with what we get
+  // from reading /proc/.../maps for non-initial mappings.
   dev_t device_;
   ino_t inode_;
   const int prot_;
@@ -233,7 +240,7 @@ public:
   class Mapping {
   public:
     Mapping(const KernelMapping& map, const KernelMapping& recorded_map,
-            EmuFile::shr_ptr emu_file,
+            EmuFile::shr_ptr emu_file = nullptr,
             std::unique_ptr<struct stat> mapped_file_stat = nullptr,
             void* local_addr = nullptr,
             std::shared_ptr<MonitoredSharedMemory>&& monitored = nullptr);
@@ -273,11 +280,8 @@ public:
       IS_THREAD_LOCALS = 0x2,
       // This mapping is used for syscallbuf patch stubs
       IS_PATCH_STUBS = 0x4,
-      // This mapping has been created by the replayer to guarantee SIGBUS
-      // in a region whose backing file was too short during recording.
-      IS_SIGBUS_REGION = 0x8,
       // This mapping is the rr page
-      IS_RR_PAGE = 0x10
+      IS_RR_PAGE = 0x8
     };
     uint32_t flags;
   };
@@ -575,7 +579,8 @@ public:
    * hypervisor with 32-bit x86 guest, debug_status watchpoint bits
    * are known to not be set on singlestep).
    */
-  bool notify_watchpoint_fired(uintptr_t debug_status);
+  bool notify_watchpoint_fired(uintptr_t debug_status,
+      remote_code_ptr address_of_singlestep_start);
   /**
    * Return true if any watchpoint has fired. Will keep returning true until
    * consume_watchpoint_changes() is called.
@@ -591,6 +596,15 @@ public:
    * Return all changed watchpoints in |watches| and clear their changed flags.
    */
   std::vector<WatchConfig> consume_watchpoint_changes();
+
+  void set_shm_size(remote_ptr<void> addr, size_t bytes) {
+    shm_sizes[addr] = bytes;
+  }
+  /**
+   * Dies if no shm size is registered for the address.
+   */
+  size_t get_shm_size(remote_ptr<void> addr) { return shm_sizes[addr]; }
+  void remove_shm_size(remote_ptr<void> addr) { shm_sizes.erase(addr); }
 
   /**
    * Make [addr, addr + num_bytes) inaccessible within this
@@ -720,13 +734,17 @@ public:
 
   static uint32_t chaos_mode_min_stack_size() { return 8 * 1024 * 1024; }
 
-  remote_ptr<void> chaos_mode_find_free_memory(Task* t, size_t len);
+  remote_ptr<void> chaos_mode_find_free_memory(RecordTask* t, size_t len);
   remote_ptr<void> find_free_memory(
       size_t len, remote_ptr<void> after = remote_ptr<void>());
 
   PropertyTable& properties() { return properties_; }
 
-  void post_vm_clone(Task* t);
+  /**
+   * The return value indicates whether we (re)created the preload_thread_locals
+   * area.
+   */
+  bool post_vm_clone(Task* t);
   /**
    * TaskUid for the task whose locals are stored in the preload_thread_locals
    * area.
@@ -742,6 +760,21 @@ public:
    * range (resetting them and storing the new value).
    */
   void maybe_update_breakpoints(Task* t, remote_ptr<uint8_t> addr, size_t len);
+
+  /**
+   * Call this to ensure that the mappings in `range` during replay has the same length
+   * is collapsed to a single mapping. The caller guarantees that all the
+   * mappings in the range can be coalesced (because they corresponded to a single
+   * mapping during recording).
+   * The end of the range might be in the middle of a mapping.
+   * The start of the range might also be in the middle of a mapping.
+   */
+  void ensure_replay_matches_single_recorded_mapping(Task* t, MemoryRange range);
+
+  /**
+   * Print process maps.
+   */
+  static void print_process_maps(Task* t);
 
 private:
   struct Breakpoint;
@@ -991,6 +1024,9 @@ private:
   remote_ptr<void> brk_end;
   /* All segments mapped into this address space. */
   MemoryMap mem;
+  /* Sizes of SYSV shm segments, by address. We use this to determine the size
+   * of memory regions unmapped via shmdt(). */
+  std::map<remote_ptr<void>, size_t> shm_sizes;
   std::set<remote_ptr<void>> monitored_mem;
   /* madvise DONTFORK regions */
   std::set<MemoryRange> dont_fork;

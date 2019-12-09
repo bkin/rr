@@ -3,6 +3,7 @@
 #include "ReplayTimeline.h"
 
 #include <math.h>
+#include <sstream>
 
 #include "core.h"
 #include "fast_forward.h"
@@ -16,6 +17,21 @@ ReplayTimeline::InternalMark::~InternalMark() {
   if (owner && checkpoint) {
     owner->remove_mark_with_checkpoint(proto.key);
   }
+}
+
+void ReplayTimeline::InternalMark::full_print(FILE* out) const {
+  ostringstream buf;
+  buf << proto.key;
+  fprintf(out, "{%s,regs:", buf.str().c_str());
+  proto.regs.print_register_file(out);
+  fputs(",return_addresses=[", out);
+  for (int i = 0; i < ReturnAddressList::COUNT; ++i) {
+    fprintf(out, "%p", (void*)proto.return_addresses.addresses[i].as_int());
+    if (i + 1 < ReturnAddressList::COUNT) {
+      fputc(',', out);
+    }
+  }
+  fputs("]}", out);
 }
 
 ostream& operator<<(ostream& s, const ReplayTimeline::MarkKey& o) {
@@ -61,14 +77,11 @@ bool ReplayTimeline::less_than(const Mark& m1, const Mark& m2) {
   return false;
 }
 
-ReplayTimeline::ReplayTimeline(std::shared_ptr<ReplaySession> session,
-                               const ReplaySession::Flags& session_flags)
-    : session_flags(session_flags),
-      current(std::move(session)),
+ReplayTimeline::ReplayTimeline(std::shared_ptr<ReplaySession> session)
+    : current(std::move(session)),
       breakpoints_applied(false),
       reverse_execution_barrier_event(0) {
   current->set_visible_execution(false);
-  current->set_flags(session_flags);
 }
 
 ReplayTimeline::~ReplayTimeline() {
@@ -215,11 +228,23 @@ void ReplayTimeline::mark_after_singlestep(const Mark& from,
     for (size_t i = 0; i < mark_vector.size(); ++i) {
       if (mark_vector[i] == from.ptr) {
         if (i + 1 >= mark_vector.size() || mark_vector[i + 1] != m.ptr) {
+          ssize_t m_prev = -1;
           for (size_t j = 0; j < mark_vector.size(); ++j) {
             LOG(debug) << "  mark_vector[" << j << "] " << *mark_vector[j];
+            if (mark_vector[j] == m.ptr && j > 0) {
+              m_prev = j - 1;
+            }
           }
-          ASSERT(result.break_status.task, false) << " expected to find " << m
-                                                  << " at index " << i + 1;
+          if (m_prev >= 0) {
+            fprintf(stderr, "Probable previous-to-duplicated-state at %d:", (int)m_prev);
+            mark_vector[m_prev]->full_print(stderr);
+            fprintf(stderr, "Probable previous-to-duplicated-state at %d:", (int)i);
+            from.ptr->full_print(stderr);
+            fprintf(stderr, "Probable duplicated state at %d:", (int)m_prev + 1);
+            m.ptr->full_print(stderr);
+          }
+          ASSERT(result.break_status.task, false)
+              << " Probable duplicated states leading to " << m << " at index " << i + 1;
         }
         break;
       }
@@ -305,10 +330,9 @@ void ReplayTimeline::seek_to_before_key(const MarkKey& key) {
       // We can use the current session, so do nothing.
     } else {
       // nowhere earlier to go, so restart from beginning.
-      current = ReplaySession::create(current->trace_reader().dir());
+      current = ReplaySession::create(current->trace_reader().dir(), current->flags());
       breakpoints_applied = false;
       current_at_or_after_mark = nullptr;
-      current->set_flags(session_flags);
     }
   } else {
     --it;
@@ -319,20 +343,19 @@ void ReplayTimeline::seek_to_before_key(const MarkKey& key) {
     } else {
       // Return one of the checkpoints at *it.
       current = nullptr;
-      for (auto mark_it : marks[it->first]) {
-        shared_ptr<InternalMark> m(mark_it);
-        if (m->checkpoint) {
-          current = m->checkpoint->clone();
-          // At this point, m->checkpoint is fully initialized but current
-          // is not. Swap them so that m->checkpoint is not fully
+      for (const auto& mark_it : marks[it->first]) {
+        if (mark_it->checkpoint) {
+          current = mark_it->checkpoint->clone();
+          // At this point, mark_it->checkpoint is fully initialized but current
+          // is not. Swap them so that mark_it->checkpoint is not fully
           // initialized, to reduce resource usage.
-          swap(current, m->checkpoint);
+          swap(current, mark_it->checkpoint);
+          breakpoints_applied = false;
+          current_at_or_after_mark = mark_it;
           break;
         }
       }
       DEBUG_ASSERT(current);
-      breakpoints_applied = false;
-      current_at_or_after_mark = nullptr;
     }
   }
 }
@@ -430,18 +453,20 @@ ReplayResult ReplayTimeline::replay_step_to_mark(
     ReplaySession::StepConstraints constraints =
         strategy.setup_step_constraints();
     constraints.ticks_target = mark.ptr->proto.key.ticks - 1;
-    result = current->replay_step(constraints);
-    bool approaching_ticks_target =
+    if (constraints.ticks_target > 0) {
+      result = current->replay_step(constraints);
+      bool approaching_ticks_target =
         result.break_status.approaching_ticks_target;
-    result.break_status.approaching_ticks_target = false;
-    // We can't be at the mark yet.
-    ASSERT(t, t->tick_count() < mark.ptr->proto.key.ticks);
-    // If there's a break indicated, we should return that to the
-    // caller without doing any more work
-    if (!approaching_ticks_target || result.break_status.any_break()) {
-      update_strategy_and_fix_watchpoint_quirk(strategy, constraints, result,
-                                               before);
-      return result;
+      result.break_status.approaching_ticks_target = false;
+      // We can't be at the mark yet.
+      ASSERT(t, t->tick_count() < mark.ptr->proto.key.ticks);
+      // If there's a break indicated, we should return that to the
+      // caller without doing any more work
+      if (!approaching_ticks_target || result.break_status.any_break()) {
+        update_strategy_and_fix_watchpoint_quirk(strategy, constraints, result,
+                                                 before);
+        return result;
+      }
     }
     // We may not have made any progress so we'll need to try another strategy
   }
@@ -551,7 +576,7 @@ void ReplayTimeline::seek_to_mark(const Mark& mark) {
 bool ReplayTimeline::fix_watchpoint_coalescing_quirk(ReplayResult& result,
                                                      const ProtoMark& before) {
   if (result.status == REPLAY_EXITED ||
-      result.break_status.watchpoints_hit.empty()) {
+      result.break_status.data_watchpoints_hit().empty()) {
     // no watchpoint hit. Nothing to fix.
     return false;
   }
@@ -580,7 +605,7 @@ bool ReplayTimeline::fix_watchpoint_coalescing_quirk(ReplayResult& result,
         // if a watchpoint is triggered by the string instruction at
         // string_instruction_ip, it will have the correct timing.
         result = current->replay_step(RUN_SINGLESTEP_FAST_FORWARD);
-        if (!result.break_status.watchpoints_hit.empty()) {
+        if (!result.break_status.data_watchpoints_hit().empty()) {
           LOG(debug) << "Fixed x86-string coalescing quirk; now at "
                      << current_mark_key() << " (new cx "
                      << result.break_status.task->regs().cx() << ")";
@@ -646,7 +671,7 @@ bool ReplayTimeline::add_watchpoint(ReplayTask* t, remote_ptr<void> addr,
   }
   watchpoints.insert(
       make_tuple(t->vm()->uid(), addr, num_bytes, type, move(condition)));
-  no_watchpoints_hit_interval_start = no_watchpoints_hit_interval_start =
+  no_watchpoints_hit_interval_start = no_watchpoints_hit_interval_end =
       Mark();
   return true;
 }
@@ -688,6 +713,12 @@ void ReplayTimeline::apply_breakpoints_internal() {
       vm->add_breakpoint(get<1>(bp), BKPT_USER);
     }
   }
+  for (auto& wp : watchpoints) {
+    AddressSpace* vm = current->find_address_space(get<0>(wp));
+    if (vm && get<3>(wp) == WATCH_EXEC) {
+      vm->add_watchpoint(get<1>(wp), get<2>(wp), get<3>(wp));
+    }
+  }
 }
 
 void ReplayTimeline::apply_breakpoints_and_watchpoints() {
@@ -703,7 +734,7 @@ void ReplayTimeline::apply_breakpoints_and_watchpoints() {
     // be created) and we should reapply watchpoints then.
     // XXX we could make this more efficient by providing a method to set
     // several watchpoints at once on a given AddressSpace.
-    if (vm) {
+    if (vm && get<3>(wp) != WATCH_EXEC) {
       vm->add_watchpoint(get<1>(wp), get<2>(wp), get<3>(wp));
     }
   }
@@ -714,6 +745,12 @@ void ReplayTimeline::unapply_breakpoints_internal() {
     AddressSpace* vm = current->find_address_space(get<0>(bp));
     if (vm) {
       vm->remove_breakpoint(get<1>(bp), BKPT_USER);
+    }
+    for (auto& wp : watchpoints) {
+      AddressSpace* vm = current->find_address_space(get<0>(wp));
+      if (vm && get<3>(wp) == WATCH_EXEC) {
+        vm->remove_watchpoint(get<1>(wp), get<2>(wp), get<3>(wp));
+      }
     }
   }
 }
@@ -726,7 +763,7 @@ void ReplayTimeline::unapply_breakpoints_and_watchpoints() {
   unapply_breakpoints_internal();
   for (auto& wp : watchpoints) {
     AddressSpace* vm = current->find_address_space(get<0>(wp));
-    if (vm) {
+    if (vm && get<3>(wp) != WATCH_EXEC) {
       vm->remove_watchpoint(get<1>(wp), get<2>(wp), get<3>(wp));
     }
   }
@@ -928,7 +965,7 @@ ReplayResult ReplayTimeline::reverse_continue(
         // populate the interval with new checkpoints, speeding up
         // the following seek and possibly future operations.
       }
-      at_breakpoint = result.break_status.breakpoint_hit;
+      at_breakpoint = result.break_status.hardware_or_software_breakpoint_hit();
       bool avoidable_stop = result.break_status.breakpoint_hit ||
                             !result.break_status.watchpoints_hit.empty();
       if (avoidable_stop) {
@@ -952,14 +989,14 @@ ReplayResult ReplayTimeline::reverse_continue(
         set_short_checkpoint();
       }
 
-      if (!result.break_status.watchpoints_hit.empty() ||
+      if (!result.break_status.data_watchpoints_hit().empty() ||
           result.break_status.signal) {
         dest = mark();
         if (result.break_status.signal) {
           LOG(debug) << "Found signal break at " << dest;
         } else {
           LOG(debug) << "Found watch break at " << dest << ", addr="
-                     << result.break_status.watchpoints_hit[0].addr;
+                     << result.break_status.data_watchpoints_hit()[0].addr;
         }
         final_result = result;
         final_tuid = result.break_status.task ? result.break_status.task->tuid()
@@ -989,7 +1026,7 @@ ReplayResult ReplayTimeline::reverse_continue(
 
       // If there is a breakpoint at the current ip() where we start a
       // reverse-continue, gdb expects us to skip it.
-      if (result.break_status.breakpoint_hit) {
+      if (result.break_status.hardware_or_software_breakpoint_hit()) {
         dest = mark();
         LOG(debug) << "Found breakpoint break at " << dest;
         final_result = result;
@@ -1013,9 +1050,10 @@ ReplayResult ReplayTimeline::reverse_continue(
         ++stop_count;
         if (stop_count > stop_count_limit) {
           Mark before_running = mark();
-          if (run_forward_to_intermediate_point(end, made_progress_between_stops
-                                                         ? DONT_FORCE_PROGRESS
-                                                         : FORCE_PROGRESS)) {
+          if (run_forward_to_intermediate_point(end,
+                                                made_progress_between_stops
+                                                    ? DONT_FORCE_PROGRESS
+                                                    : FORCE_PROGRESS)) {
             DEBUG_ASSERT(!at_mark(end));
             // We made some progress towards |end| with breakpoints/watchpoints
             // disabled, without reaching |end|. Continuing running forward from
@@ -1167,6 +1205,9 @@ ReplayResult ReplayTimeline::reverse_singlestep(
     Mark step_start = set_short_checkpoint();
     ReplayResult destination_candidate_result;
     TaskUid destination_candidate_tuid;
+    // True when the singlestep starting at the destination candidate saw
+    // another task break.
+    bool destination_candidate_saw_other_task_break = false;
 
     if (is_start_of_reverse_execution_barrier_event()) {
       destination_candidate = mark();
@@ -1188,7 +1229,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
           constraints.stop_before_states.push_back(&end.ptr->proto.regs);
           result = current->replay_step(constraints);
           update_observable_break_status(now, result);
-          if (result.break_status.breakpoint_hit) {
+          if (result.break_status.hardware_or_software_breakpoint_hit()) {
             // If we hit a breakpoint while singlestepping, we didn't
             // make any progress.
             unapply_breakpoints_and_watchpoints();
@@ -1207,6 +1248,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
                        << destination_candidate;
             destination_candidate_result = result;
             destination_candidate_tuid = result.break_status.task->tuid();
+            destination_candidate_saw_other_task_break = seen_other_task_break;
             seen_other_task_break = false;
             step_start = now;
           }
@@ -1216,7 +1258,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
           if (result.break_status.any_break()) {
             seen_other_task_break = true;
           }
-          if (result.break_status.breakpoint_hit) {
+          if (result.break_status.hardware_or_software_breakpoint_hit()) {
             unapply_breakpoints_and_watchpoints();
             result = current->replay_step(RUN_SINGLESTEP_FAST_FORWARD);
             update_observable_break_status(now, result);
@@ -1238,6 +1280,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
         destination_candidate_result = result;
         destination_candidate_result.break_status.task_exit = true;
         destination_candidate_tuid = current->current_task()->tuid();
+        destination_candidate_saw_other_task_break = false;
         seen_other_task_break = false;
       }
 
@@ -1250,7 +1293,7 @@ ReplayResult ReplayTimeline::reverse_singlestep(
     no_watchpoints_hit_interval_end =
         no_watchpoints_hit_interval_start ? end : Mark();
 
-    if (seen_other_task_break) {
+    if (seen_other_task_break || destination_candidate_saw_other_task_break) {
       // We saw a break in another task that the debugger cares about, but
       // that's not the stepping task. Report that break instead of the
       // singlestep.
@@ -1344,7 +1387,8 @@ ReplayResult ReplayTimeline::replay_step_forward(RunCommand command,
   }
   maybe_add_reverse_exec_checkpoint(LOW_OVERHEAD);
 
-  bool did_hit_breakpoint = result.break_status.breakpoint_hit;
+  bool did_hit_breakpoint =
+      result.break_status.hardware_or_software_breakpoint_hit();
   evaluate_conditions(result);
   if (did_hit_breakpoint && !result.break_status.any_break()) {
     // Singlestep past the breakpoint

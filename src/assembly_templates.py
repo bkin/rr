@@ -1,4 +1,4 @@
-import StringIO
+from io import StringIO
 import sys
 
 class RawBytes(object):
@@ -152,13 +152,33 @@ templates = {
         RawBytes(0xff, 0x25, 0x00, 0x00, 0x00, 0x00),       # jmp *0(%rip)
         Field('jump_target', 8),
     ),
+    'X64DLRuntimeResolve': AssemblyTemplate(
+        RawBytes(0x53),                   # push %rbx
+        RawBytes(0x48, 0x89, 0xe3),       # mov %rsp,%rbx
+        RawBytes(0x48, 0x83, 0xe4, 0xf0), # and $0xfffffffffffffff0,%rsp
+    ),
+    'X64DLRuntimeResolve2': AssemblyTemplate(
+        RawBytes(0x53),                   # push %rbx
+        RawBytes(0x48, 0x89, 0xe3),       # mov %rsp,%rbx
+        RawBytes(0x48, 0x83, 0xe4, 0xc0), # and $0xffffffffffffffc0,%rsp
+    ),
+    'X64DLRuntimeResolvePrelude': AssemblyTemplate(
+        RawBytes(0xd9, 0x74, 0x24, 0xe0),                               # fstenv -32(%rsp)
+        RawBytes(0x48, 0xc7, 0x44, 0x24, 0xf4, 0x00, 0x00, 0x00, 0x00), # movq $0,-12(%rsp)
+        RawBytes(0xd9, 0x64, 0x24, 0xe0),                               # fldenv -32(%rsp)
+        RawBytes(0x53),                   # push %rbx
+        RawBytes(0x48, 0x89, 0xe3),       # mov %rsp,%rbx
+        RawBytes(0x48, 0x83, 0xe4, 0xc0), # and $0xffffffffffffffc0,%rsp
+        RawBytes(0xe9),                   # jmp $relative_addr
+        Field('relative_addr', 4),
+    ),
 }
 
 def byte_array_name(name):
     return '%s_bytes' % name
 
 def generate_match_method(byte_array, template):
-    s = StringIO.StringIO()
+    s = StringIO()
     fields = template.fields()
     field_types = [f.c_type() for f in fields]
     field_names = [f.name for f in fields]
@@ -181,7 +201,7 @@ def generate_match_method(byte_array, template):
     return s.getvalue()
 
 def generate_substitute_method(byte_array, template):
-    s = StringIO.StringIO()
+    s = StringIO()
     fields = template.fields()
     field_types = [f.c_type() for f in fields]
     field_names = [f.name for f in fields]
@@ -203,7 +223,7 @@ def generate_substitute_method(byte_array, template):
     return s.getvalue()
 
 def generate_field_end_methods(byte_array, template):
-    s = StringIO.StringIO()
+    s = StringIO()
     offset = 0
     for chunk in template.chunks:
         offset += len(chunk)
@@ -212,20 +232,20 @@ def generate_field_end_methods(byte_array, template):
     return s.getvalue()
 
 def generate_size_member(byte_array):
-    s = StringIO.StringIO()
+    s = StringIO()
     s.write('  static const size_t size = sizeof(%s);' % byte_array)
     return s.getvalue()
 
 def generate(f):
     # Raw bytes.
-    for name, template in templates.iteritems():
+    for name, template in templates.items():
         bytes = template.bytes()
         f.write('static const uint8_t %s[] = { %s };\n'
                 % (byte_array_name(name), ', '.join(['0x%x' % b for b in bytes])))
     f.write('\n')
 
     # Objects representing assembly templates.
-    for name, template in templates.iteritems():
+    for name, template in templates.items():
         byte_array = byte_array_name(name)
         f.write("""class %(class_name)s {
 public:

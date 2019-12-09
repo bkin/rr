@@ -1,6 +1,6 @@
 # *-* Mode: cmake; *-*
 
-cmake_minimum_required(VERSION 2.8.5)
+cmake_minimum_required(VERSION 3.1.0)
 project(rr C CXX ASM)
 
 # "Do not add flags to export symbols from executables without the ENABLE_EXPORTS target property."
@@ -24,6 +24,7 @@ set(BUILD_SHARED_LIBS ON)
 
 set(EXECUTABLE_OUTPUT_PATH ${PROJECT_BINARY_DIR}/bin)
 set(CMAKE_LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib/rr)
+set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
 set(BUILD_TESTS ON CACHE BOOL "Build tests")
 set(WILL_RUN_TESTS ${BUILD_TESTS} CACHE BOOL "Run tests")
@@ -31,27 +32,70 @@ set(WILL_RUN_TESTS ${BUILD_TESTS} CACHE BOOL "Run tests")
 # CAREFUL!  "-" is an invalid character in RPM package names, while
 # debian is happy with it.  However, "_" is illegal in debs, while RPM
 # is cool with it.  Sigh.
-set(rr_VERSION_MAJOR 4)
-set(rr_VERSION_MINOR 5)
+set(rr_VERSION_MAJOR 5)
+set(rr_VERSION_MINOR 2)
 set(rr_VERSION_PATCH 0)
 
 add_definitions(-DRR_VERSION="${rr_VERSION_MAJOR}.${rr_VERSION_MINOR}.${rr_VERSION_PATCH}")
 
-set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -pthread -g3 -Wall -Wextra -Wstrict-prototypes -std=gnu11")
-set(CMAKE_C_FLAGS_DEBUG "-O0 -Werror -DDEBUG -UNDEBUG")
-set(CMAKE_C_FLAGS_RELEASE "-O2 -UDEBUG -DNDEBUG")
+execute_process(
+  COMMAND git rev-parse HEAD
+  WORKING_DIRECTORY ${CMAKE_SOURCE_DIR}
+  OUTPUT_VARIABLE GIT_REVISION
+  OUTPUT_STRIP_TRAILING_WHITESPACE
+)
+configure_file(
+  ${CMAKE_SOURCE_DIR}/src/git_revision.h.in
+  ${CMAKE_BINARY_DIR}/git_revision.h
+)
+
+set(FLAGS_COMMON "-msse2 -D__MMX__ -D__SSE__ -D__SSE2__ -D__USE_LARGEFILE64 -pthread")
+set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} ${FLAGS_COMMON} -Wstrict-prototypes -std=gnu11")
 # Define __STDC_LIMIT_MACROS so |#include <stdint.h>| works as expected.
 # Define __STDC_FORMAT_MACROS so |#include <inttypes.h>| works as expected.
-set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -D__USE_LARGEFILE64 -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++11 -pthread -g3 -Wall -Wextra")
-set(CMAKE_CXX_FLAGS_DEBUG "-O0 -Werror -DDEBUG -UNDEBUG")
-set(CMAKE_CXX_FLAGS_RELEASE "-O2 -UDEBUG -DNDEBUG")
-set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -g3")
+set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} ${FLAGS_COMMON} -D__STDC_LIMIT_MACROS -D__STDC_FORMAT_MACROS -std=c++14")
+
+# We support three build types:
+# DEBUG: suitable for debugging rr
+# RELEASE: suitable for using rr in production (but keeps rr debuginfo)
+# OTHER: suitable for using rr in production, but honouring distro/user opt/debug settings
+# (which we assume are suitable for production use)
+
+# Base settings for debug and release/unspecified builds.
+# Use -Werror for debug builds because we assume a developer is building, not a user.
+set(RR_FLAGS_DEBUG "-Wall -Wextra -DDEBUG -UNDEBUG")
+set(RR_FLAGS_RELEASE "-Wall -Wextra -UDEBUG -DNDEBUG")
+
+# The folowing settings are the defaults for the OTHER build type.
+# Flags used to build the preload library. MUST have debuginfo enabled. SHOULD be optimized.
+set(PRELOAD_COMPILE_FLAGS "${RR_FLAGS_RELEASE} -fno-stack-protector -g3")
+# Flags used to build Brotli. SHOULD be optimized. MUST NOT error on warnings.
+set(BROTLI_COMPILE_FLAGS ${RR_FLAGS_RELEASE})
+# Flags used to build tests. MUST have -DDEBUG and debuginfo enabled, MUST NOT be optimized.
+set(RR_TEST_FLAGS "${RR_FLAGS_DEBUG} -g3 -O0")
+# Flags used to build other files. Entirely build-type-dependent.
+set(RR_FLAGS ${RR_FLAGS_RELEASE})
+
+# Now override for build type.
+string(TOLOWER ${CMAKE_BUILD_TYPE} LOWERCASE_CMAKE_BUILD_TYPE)
+if(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "debug")
+  set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} -O2 -Werror")
+  set(BROTLI_COMPILE_FLAGS "${RR_FLAGS_RELEASE} -O2")
+  set(RR_TEST_FLAGS "${RR_TEST_FLAGS} -Werror")
+  set(RR_FLAGS "${RR_FLAGS_DEBUG} -g3 -Werror")
+elseif(LOWERCASE_CMAKE_BUILD_TYPE STREQUAL "release")
+  # CMake itself will add optimization flags
+  set(RR_FLAGS "${RR_FLAGS_RELEASE} -g3")
+endif()
 
 if(CMAKE_C_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_C_FLAGS "${CMAKE_C_FLAGS} -Wno-unused-command-line-argument")
 endif()
 if(CMAKE_CXX_COMPILER_ID STREQUAL "Clang")
   set(CMAKE_CXX_FLAGS "${CMAKE_CXX_FLAGS} -Wno-unused-command-line-argument")
+endif()
+if (CMAKE_ASM_COMPILER_ID STREQUAL "Clang")
+  set(CMAKE_ASM_FLAGS "${CMAKE_ASM_FLAGS} -fno-integrated-as")
 endif()
 
 option(force32bit "Force a 32-bit rr build, rather than both 64 and 32-bit. rr will only be able to record and replay 32-bit processes.")
@@ -114,6 +158,11 @@ if(CMAKE_HOST_SYSTEM_PROCESSOR STREQUAL "x86_64" AND NOT rr_64BIT)
    endif()
 endif()
 
+find_program(CAPNP capnp)
+if(${CAPNP} STREQUAL "CAPNP-NOTFOUND")
+  message(FATAL_ERROR "Can't find 'capnp' command; install Capnproto packages? https://github.com/mozilla/rr/wiki/Building-And-Installing#tldr")
+endif()
+
 set(REQUIRED_LIBS
   capnp
 )
@@ -135,6 +184,7 @@ endforeach(required_lib)
 # ==== brotli ====
 set(BROTLI_FILES
   third-party/brotli/common/dictionary.c
+  third-party/brotli/common/transform.c
   third-party/brotli/dec/bit_reader.c
   third-party/brotli/dec/decode.c
   third-party/brotli/dec/huffman.c
@@ -165,6 +215,7 @@ set(BROTLI_FILES
   third-party/brotli/enc/dictionary_hash.c
   third-party/brotli/enc/dictionary_hash.h
   third-party/brotli/enc/encode.c
+  third-party/brotli/enc/encoder_dict.c
   third-party/brotli/enc/entropy_encode.c
   third-party/brotli/enc/entropy_encode.h
   third-party/brotli/enc/entropy_encode_static.h
@@ -199,7 +250,7 @@ set(BROTLI_FILES
 )
 add_library(brotli STATIC ${BROTLI_FILES})
 set_source_files_properties(${BROTLI_FILES}
-                            PROPERTIES COMPILE_FLAGS ${CMAKE_C_FLAGS_RELEASE})
+                            PROPERTIES COMPILE_FLAGS ${BROTLI_COMPILE_FLAGS})
 # ==== brotli ====
 
 find_path(SECCOMP NAMES "linux/seccomp.h")
@@ -207,11 +258,8 @@ if(NOT SECCOMP)
   message(FATAL_ERROR "Couldn't find linux/seccomp.h. You may need to upgrade your kernel.")
 endif()
 
-# Check for Python >=2.7 but not Python 3.
-find_package(PythonInterp 2.7 REQUIRED)
-if(PYTHON_VERSION_MAJOR GREATER 2)
-  message(FATAL_ERROR "Python 3 is not supported, please use Python 2.7.")
-endif()
+set(Python_ADDITIONAL_VERSIONS 3 3.8 3.7 3.6 3.5 3.4 3.3 3.2 3.1 3.0)
+find_package(PythonInterp 3 REQUIRED)
 
 execute_process(COMMAND "${PYTHON_EXECUTABLE}" "-c" "# nothing"
                 RESULT_VARIABLE python_status)
@@ -249,16 +297,6 @@ if(WILL_RUN_TESTS)
   endif()
 endif()
 
-set(PRELOAD_COMPILE_FLAGS "-fno-stack-protector")
-
-if (NOT DEBUG_PRELOAD_LIB)
-set(PRELOAD_COMPILE_FLAGS "${PRELOAD_COMPILE_FLAGS} ${CMAKE_C_FLAGS_RELEASE}")
-endif()
-
-set_source_files_properties(src/preload/syscallbuf.c
-                            src/preload/overrides.c
-                            PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
-
 include_directories("${PROJECT_SOURCE_DIR}/include")
 include_directories("${PROJECT_SOURCE_DIR}/third-party/proc-service")
 include_directories("${PROJECT_SOURCE_DIR}/third-party/brotli/include")
@@ -267,13 +305,24 @@ include_directories("${CMAKE_CURRENT_BINARY_DIR}")
 
 # Order matters here! syscall_hook.S must be immediately before syscallbuf.c,
 # breakpoint_table.S must be before overrides.c, which must be last.
-add_library(rrpreload
-  src/preload/syscall_hook.S
-  src/preload/syscallbuf.c
-  src/preload/raw_syscall.S
-  src/preload/breakpoint_table.S
-  src/preload/overrides.c
+set(PRELOAD_FILES
+  syscall_hook.S
+  syscallbuf.c
+  raw_syscall.S
+  breakpoint_table.S
+  overrides.c
 )
+set(PRELOAD_SOURCE_FILES
+  ${PRELOAD_FILES}
+  preload_interface.h
+  syscallbuf.h
+)
+add_library(rrpreload)
+foreach(file ${PRELOAD_FILES})
+  target_sources(rrpreload PUBLIC "${CMAKE_SOURCE_DIR}/src/preload/${file}")
+  set_source_files_properties("${CMAKE_SOURCE_DIR}/src/preload/${file}"
+                              PROPERTIES COMPILE_FLAGS ${PRELOAD_COMPILE_FLAGS})
+endforeach(file)
 set_target_properties(rrpreload PROPERTIES LINK_FLAGS "-nostartfiles")
 
 # Ensure that CMake knows about our generated files.
@@ -343,12 +392,15 @@ set(RR_SOURCES
   src/test/cpuid_loop.S
   src/AddressSpace.cc
   src/AutoRemoteSyscalls.cc
+  src/BuildidCommand.cc
   src/Command.cc
   src/CompressedReader.cc
   src/CompressedWriter.cc
+  src/CPUFeaturesCommand.cc
   src/CPUIDBugDetector.cc
   src/DiversionSession.cc
   src/DumpCommand.cc
+  src/Dwarf.cc
   src/ElfReader.cc
   src/EmuFs.cc
   src/Event.cc
@@ -356,6 +408,7 @@ set(RR_SOURCES
   src/fast_forward.cc
   src/FdTable.cc
   src/FileMonitor.cc
+  src/FileNameCommand.cc
   src/Flags.cc
   src/ftrace.cc
   src/GdbCommand.cc
@@ -369,6 +422,7 @@ set(RR_SOURCES
   src/kernel_abi.cc
   src/kernel_metadata.cc
   src/log.cc
+  src/LsCommand.cc
   src/MagicSaveDataMonitor.cc
   src/MmappedFileMonitor.cc
   src/MonitoredSharedMemory.cc
@@ -395,11 +449,13 @@ set(RR_SOURCES
   src/Scheduler.cc
   src/SeccompFilterRewriter.cc
   src/Session.cc
+  src/SourcesCommand.cc
   src/StdioMonitor.cc
   src/Task.cc
-  src/TaskGroup.cc
+  src/ThreadGroup.cc
   src/ThreadDb.cc
   src/TraceFrame.cc
+  src/TraceInfoCommand.cc
   src/TraceStream.cc
   src/VirtualPerfCounterMonitor.cc
   src/util.cc
@@ -407,6 +463,9 @@ set(RR_SOURCES
   ${CMAKE_CURRENT_BINARY_DIR}/rr_trace.capnp.c++
   third-party/blake2/blake2b.c
 )
+
+set_source_files_properties(${RR_SOURCES}
+                            PROPERTIES COMPILE_FLAGS ${RR_FLAGS})
 
 function(post_build_executable target)
 # grsecurity needs these. But if we add them ourselves, they may conflict
@@ -417,7 +476,18 @@ function(post_build_executable target)
 #                     COMMAND setfattr ARGS -n user.pax.flags -v m $<TARGET_FILE:${target}>)
 endfunction(post_build_executable)
 
+if(UNIX)
+  include(GNUInstallDirs)
+else()
+  set(CMAKE_INSTALL_LIBDIR "lib")
+  set(CMAKE_INSTALL_BINDIR "bin")
+  set(CMAKE_INSTALL_DATADIR "share")
+  set(CMAKE_INSTALL_DOCDIR "${CMAKE_INSTALL_DATADIR}/doc")
+  set(CMAKE_INSTALL_INCLUDEDIR "include")
+endif()
+
 option(RR_BUILD_SHARED "Build the rr shared library as well as the binary (experimental).")
+
 if(RR_BUILD_SHARED)
   add_library(rr ${RR_SOURCES})
   set_target_properties(rr PROPERTIES LIBRARY_OUTPUT_DIRECTORY ${PROJECT_BINARY_DIR}/lib)
@@ -427,11 +497,12 @@ if(RR_BUILD_SHARED)
   set_target_properties(rrbin PROPERTIES ENABLE_EXPORTS true OUTPUT_NAME rr)
   set_target_properties(rrbin PROPERTIES INSTALL_RPATH "${CMAKE_INSTALL_PREFIX}/lib")
   set_target_properties(rrbin PROPERTIES INSTALL_RPATH_USE_LINK_PATH true)
+  set_target_properties(brotli PROPERTIES POSITION_INDEPENDENT_CODE ON)
   target_link_libraries(rrbin rr)
   install(TARGETS rr
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib
-    ARCHIVE DESTINATION lib)
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR})
 else()
   add_executable(rr ${RR_SOURCES} src/main.cc)
   set_target_properties(rr PROPERTIES ENABLE_EXPORTS true)
@@ -439,6 +510,12 @@ else()
   set(RR_BIN rr)
 endif()
 add_dependencies(rr Generated Pages)
+
+option(strip "Strip debug info from rr binary")
+
+if(strip)
+  set_target_properties(rr PROPERTIES LINK_FLAGS "-s")
+endif()
 
 target_link_libraries(rr
   ${CMAKE_DL_LIBS}
@@ -449,7 +526,9 @@ target_link_libraries(rr
 if(staticlibs)
   # Urgh ... this might not work for everyone, but there doesn't seem to be
   # a way to persuade pkg-confing/pkg_check_modules to produce the right flags
-  target_link_libraries(rr -l:libcapnp.a -l:libkj.a)
+  target_link_libraries(rr -L/home/roc/lib -l:libcapnp.a -l:libkj.a)
+  # Note that this works for both clang++ and g++
+  set(CMAKE_CXX_FLAGS "-static-libstdc++ ${CMAKE_CXX_FLAGS}")
 else()
   target_link_libraries(rr ${CAPNP_LDFLAGS})
 endif()
@@ -485,20 +564,35 @@ foreach(file ${RR_GDB_RESOURCES})
                  "${CMAKE_CURRENT_BINARY_DIR}/share/rr/${file}"
                  COPYONLY)
   install(FILES third-party/gdb/${file}
-          DESTINATION share/rr)
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/rr)
 endforeach(file)
 
+foreach(file ${PRELOAD_SOURCE_FILES})
+  configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/preload/${file}"
+                 "${CMAKE_CURRENT_BINARY_DIR}/share/rr/src/preload/${file}"
+                 COPYONLY)
+  install(FILES src/preload/${file}
+          DESTINATION ${CMAKE_INSTALL_DATADIR}/rr/src/preload)
+endforeach(file)
+
+configure_file("${CMAKE_CURRENT_SOURCE_DIR}/scripts/rr-collect-symbols.py"
+               "${CMAKE_CURRENT_BINARY_DIR}/bin/rr-collect-symbols.py"
+               COPYONLY)
+
 install(PROGRAMS scripts/signal-rr-recording.sh
-                  ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64
-                  ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay
-                  ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32
-                  ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay
-  DESTINATION bin)
+                 scripts/rr-collect-symbols.py
+                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64
+                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_64_replay
+                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32
+                 ${CMAKE_CURRENT_BINARY_DIR}/bin/rr_page_32_replay
+  DESTINATION ${CMAKE_INSTALL_BINDIR})
+install(PROGRAMS scripts/rr_completion
+  DESTINATION ${CMAKE_INSTALL_DATADIR}/bash-completion/completions RENAME rr)
 
 install(TARGETS ${RR_BIN} rrpreload rr_exec_stub
-  RUNTIME DESTINATION bin
-  LIBRARY DESTINATION lib/rr
-  ARCHIVE DESTINATION lib/rr)
+  RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+  LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
+  ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
 
 # Build 32-bit librrpreload on 64-bit builds.
 # We copy the source files into '32' subdirectories in the output
@@ -506,29 +600,20 @@ install(TARGETS ${RR_BIN} rrpreload rr_exec_stub
 # This sucks but I can't find a better way to get CMake to build
 # the same source file in two different ways.
 if(rr_32BIT AND rr_64BIT)
-  foreach(file preload_interface.h syscallbuf.h)
+  add_library(rrpreload_32)
+
+  foreach(file ${PRELOAD_SOURCE_FILES})
     configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/preload/${file}"
                    "${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
                    COPYONLY)
   endforeach(file)
 
-  foreach(file syscallbuf.c overrides.c raw_syscall.S syscall_hook.S breakpoint_table.S)
-    configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/preload/${file}"
-                   "${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
-                   COPYONLY)
+  foreach(file ${PRELOAD_FILES})
+    target_sources(rrpreload_32 PUBLIC "${CMAKE_CURRENT_BINARY_DIR}/32/${file}")
     set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
-                                PROPERTIES COMPILE_FLAGS "-m32 ${CMAKE_C_FLAGS_RELEASE}")
+                                PROPERTIES COMPILE_FLAGS "-m32 ${PRELOAD_COMPILE_FLAGS}")
   endforeach(file)
 
-  # Order matters here! syscall_hook.S must be immediately before syscallbuf.c.
-  # breakpoint_table.S must be before overrides.c, which must be last.
-  add_library(rrpreload_32
-    32/syscall_hook.S
-    32/syscallbuf.c
-    32/raw_syscall.S
-    32/breakpoint_table.S
-    32/overrides.c
-  )
   set_target_properties(rrpreload_32 PROPERTIES LINK_FLAGS "-m32 -nostartfiles")
   target_link_libraries(rrpreload_32
     ${CMAKE_DL_LIBS}
@@ -548,9 +633,9 @@ if(rr_32BIT AND rr_64BIT)
                         PROPERTIES LINK_FLAGS "-static -nostartfiles -nodefaultlibs -m32")
 
   install(TARGETS rrpreload_32 rr_exec_stub_32
-    RUNTIME DESTINATION bin
-    LIBRARY DESTINATION lib/rr
-    ARCHIVE DESTINATION lib/rr)
+    RUNTIME DESTINATION ${CMAKE_INSTALL_BINDIR}
+    LIBRARY DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr
+    ARCHIVE DESTINATION ${CMAKE_INSTALL_LIBDIR}/rr)
 endif()
 
 ##--------------------------------------------------
@@ -569,7 +654,9 @@ endif()
 set(BASIC_TESTS
   64bit_child
   _llseek
+  abort
   accept
+  acct
   adjtimex
   aio
   alarm
@@ -588,6 +675,7 @@ set(BASIC_TESTS
   brk2
   capget
   chew_cpu
+  chew_cpu_cpuid
   chmod
   chown
   clock
@@ -595,6 +683,7 @@ set(BASIC_TESTS
   clone
   clone_bad_stack
   clone_bad_tls
+  clone_fail
   clone_file_range
   clone_immediate_exit
   clone_newflags
@@ -602,11 +691,13 @@ set(BASIC_TESTS
   clone_untraced
   cloned_sigmask
   constructor
+  copy_file_range
   creat_address_not_truncated
   cross_arch
   cwd_inaccessible
   daemon
   desched_blocking_poll
+  direct
   dup
   doublesegv
   epoll_create
@@ -617,12 +708,15 @@ set(BASIC_TESTS
   exec_self
   exec_from_main_thread
   exec_from_other_thread
+  exec_stopsig
   exit_with_syscallbuf_signal
   fadvise
   fanotify
-  fault_in_code_page
-  fcntl_owner_ex
   fcntl_dupfd
+  fault_in_code_page
+  fcntl_misc
+  fcntl_owner_ex
+  fcntl_rw_hints
   fcntl_seals
   fcntl_sig
   fd_tracking_across_threads
@@ -637,6 +731,7 @@ set(BASIC_TESTS
   futex_priorities
   fxregs
   gdb_bogus_breakpoint
+  gcrypt_rdrand
   getcpu
   getgroups
   getpwnam
@@ -665,12 +760,16 @@ set(BASIC_TESTS
   ioctl
   ioctl_fs
   ioctl_pty
+  ioctl_sg
   ioctl_tty
+  join_threads
+  joystick
   kcmp
   keyctl
   kill_newborn
   kill_ptracee
   legacy_ugid
+  lsl
   madvise
   madvise_free
   map_fixed
@@ -682,16 +781,19 @@ set(BASIC_TESTS
   mlock
   mmap_adjacent_to_rr_usage
   mmap_private
+  mmap_private_grow_under_map
   mmap_ro
   mmap_self_maps_shared
   mmap_shared
   mmap_shared_grow
+  mmap_shared_grow_under_map
   mmap_shared_multiple
   mmap_shared_subpage
   mmap_shared_write
   mmap_shared_write_fork
   mmap_short_file
   mmap_tmpfs
+  mmap_write_complex
   mmap_zero_size_fd
   modify_ldt
   mount_ns_exec
@@ -701,9 +803,12 @@ set(BASIC_TESTS
   mprotect_stack
   mq
   mremap
+  mremap_after_coalesce
   mremap_grow
   mremap_grow_shared
   mremap_non_page_size
+  mremap_overwrite
+  mremap_private_grow_under_map
   mremap_shrink
   msg
   msync
@@ -731,6 +836,7 @@ set(BASIC_TESTS
   prctl_deathsig
   prctl_name
   prctl_short_name
+  prctl_speculation_ctrl
   prctl_tsc
   privileged_net_ioctl
   proc_fds
@@ -764,7 +870,7 @@ set(BASIC_TESTS
   ptracer_death
   ptracer_death_multithread
   ptracer_death_multithread_peer
-  pivot_root
+  # pivot_root ... disabled because it fails when run as root and does nothing otherwise
   quotactl
   rdtsc
   read_nothing
@@ -789,11 +895,15 @@ set(BASIC_TESTS
   sched_yield
   sched_yield_to_lower_priority
   scm_rights
+  scratch_read
   seccomp
+  seccomp_clone_fail
   seccomp_desched
+  seccomp_kill_exit
   seccomp_null
   seccomp_sigsys_args
   seccomp_sigsys_sigtrap
+  seccomp_sigsys_syscallbuf
   seccomp_tsync
   seccomp_veto_exec
   self_shebang
@@ -807,7 +917,10 @@ set(BASIC_TESTS
   setgroups
   setsid
   setuid
+  shared_exec
+  shared_write
   shm
+  shm_unmap
   sigaction_old
   sigaltstack
   sigchld_interrupt_signal
@@ -816,6 +929,8 @@ set(BASIC_TESTS
   sighandler_mask
   sigill
   signal_deferred
+  signal_during_preload_init
+  signal_frame
   signal_unstoppable
   signalfd
   sigprocmask
@@ -847,6 +962,7 @@ set(BASIC_TESTS
   stack_overflow_altstack
   stack_overflow_with_guard
   statfs
+  statx
   stdout_child
   stdout_cloexec
   stdout_dup
@@ -855,6 +971,7 @@ set(BASIC_TESTS
   switch_read
   symlink
   sync
+  sync_file_range
   syscall_bp
   syscall_in_writable_mem
   syscallbuf_signal_reset
@@ -865,6 +982,7 @@ set(BASIC_TESTS
   sysconf
   sysctl
   sysemu_singlestep
+  sysfs
   sysinfo
   tgkill
   thread_yield
@@ -912,6 +1030,7 @@ set(TESTS_WITH_PROGRAM
   async_signal_syscalls2
   async_signal_syscalls_siginfo
   async_usr1
+  blacklist
   block_clone_checkpoint
   block_clone_interrupted
   block_clone_syscallbuf_overflow
@@ -930,6 +1049,8 @@ set(TESTS_WITH_PROGRAM
   checksum_sanity
   check_lost_interrupts
   clone_interruption
+  # Disabled because it fails
+  # clone_share_vm
   clone_vfork
   conditional_breakpoint_calls
   conditional_breakpoint_offload
@@ -942,10 +1063,13 @@ set(TESTS_WITH_PROGRAM
   dev_tty
   diversion_syscall
   dlopen
+  elapsed_time
+  exec_failed
   exec_many
   execve_loop
   exit_codes
   exit_group
+  exit_race
   exit_status
   explicit_checkpoints
   fork_stress
@@ -954,6 +1078,7 @@ set(TESTS_WITH_PROGRAM
   getcwd
   goto_event
   hello
+  hooks
   # Disabled because issue #1806 makes tests fail on Debian 8.5 at least
   # history
   ignored_async_usr1
@@ -970,10 +1095,12 @@ set(TESTS_WITH_PROGRAM
   mmap_replace_most_mappings
   mmap_shared_prot
   mmap_write
+  mmap_write_private
   mprotect_growsdown
   mprotect_syscallbuf_overflow
   mutex_pi_stress
   overflow_branch_counter
+  patch_page_end
   priority
   ptrace_remote_unmap
   remove_latest_trace
@@ -996,6 +1123,7 @@ set(TESTS_WITH_PROGRAM
   shared_persistent_file
   signal_numbers
   sigprocmask_race
+  sigprocmask_rr_sigs_nondefault
   stack_growth
   step_thread
   string_instructions
@@ -1013,6 +1141,7 @@ set(TESTS_WITH_PROGRAM
   term_trace_reset
   term_trace_syscall
   thread_exit_signal
+  thread_open_race
   thread_stress
   threaded_syscall_spam
   threads
@@ -1020,11 +1149,17 @@ set(TESTS_WITH_PROGRAM
   ttyname
   unexpected_stack_growth
   user_ignore_sig
+  vdso_gettimeofday_stack
+  vdso_clock_gettime_stack
+  vdso_time_stack
   vfork
+  vsyscall_reverse_next
   wait_for_all
   watchpoint
   watchpoint_at_sched
   watchpoint_before_signal
+  watchpoint_no_progress
+  watchpoint_size_change
   watchpoint_syscall
   watchpoint_unaligned
 )
@@ -1075,13 +1210,14 @@ set(TESTS_WITHOUT_PROGRAM
   final_sigkill
   first_instruction
   fork_exec_info_thr
-  gcrypt_rdrand
   get_thread_list
   hardlink_mmapped_files
+  hbreak
   mprotect_step
   parent_no_break_child_bkpt
   parent_no_stop_child_crash
   post_exec_fpu_regs
+  proc_maps
   read_bad_mem
   record_replay
   remove_watchpoint
@@ -1138,7 +1274,7 @@ if(BUILD_TESTS)
     add_executable(${test} src/test/${test}.c)
     post_build_executable(${test})
     set_source_files_properties(src/test/${test}.c
-                                PROPERTIES COMPILE_FLAGS ${CMAKE_C_FLAGS_DEBUG})
+                                PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(${test} Generated)
     target_link_libraries(${test} -lrt -ldl)
   endforeach(test)
@@ -1154,7 +1290,7 @@ if(BUILD_TESTS)
     add_executable(${test} src/test/${test}.cc)
     post_build_executable(${test})
     set_source_files_properties(src/test/${test}.cc
-                                PROPERTIES COMPILE_FLAGS ${CMAKE_CXX_FLAGS_DEBUG})
+                                PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
     add_dependencies(${test} Generated)
     target_link_libraries(${test} -lrt)
   endforeach(test)
@@ -1164,14 +1300,14 @@ if(BUILD_TESTS)
     )
   add_dependencies(test_lib Generated)
   set_source_files_properties(src/test/test_lib.c
-                              PROPERTIES COMPILE_FLAGS ${CMAKE_C_FLAGS_DEBUG})
+                              PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
   target_link_libraries(constructor -lrt test_lib)
 
   # cpuid test needs to link with cpuid_loop.S
   add_executable(cpuid src/test/cpuid.c src/test/cpuid_loop.S)
   post_build_executable(cpuid)
   set_source_files_properties(src/test/cpuid.c
-                              PROPERTIES COMPILE_FLAGS ${CMAKE_C_FLAGS_DEBUG})
+                              PROPERTIES COMPILE_FLAGS ${RR_TEST_FLAGS})
   add_dependencies(cpuid Generated)
   target_link_libraries(cpuid -lrt)
 
@@ -1226,15 +1362,7 @@ if(BUILD_TESTS)
                      "${CMAKE_CURRENT_BINARY_DIR}/32/${test}.c"
                      COPYONLY)
       set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${test}.c"
-                                  PROPERTIES COMPILE_FLAGS "-m32 ${CMAKE_C_FLAGS_DEBUG}")
-    endforeach(test)
-
-    foreach(test ${BASIC_CPP_TESTS})
-      configure_file("${CMAKE_CURRENT_SOURCE_DIR}/src/test/${test}.cc"
-                     "${CMAKE_CURRENT_BINARY_DIR}/32/${test}.cc"
-                     COPYONLY)
-      set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${test}.cc"
-                                  PROPERTIES COMPILE_FLAGS "-m32 ${CMAKE_CXX_FLAGS_DEBUG}")
+                                  PROPERTIES COMPILE_FLAGS "-m32 ${RR_TEST_FLAGS}")
     endforeach(test)
 
     foreach(file cpuid_loop.S)
@@ -1242,23 +1370,15 @@ if(BUILD_TESTS)
                      "${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
                      COPYONLY)
       set_source_files_properties("${CMAKE_CURRENT_BINARY_DIR}/32/${file}"
-                                  PROPERTIES COMPILE_FLAGS "-m32 ${CMAKE_CXX_FLAGS_DEBUG}")
+                                  PROPERTIES COMPILE_FLAGS "-m32 ${RR_TEST_FLAGS}")
     endforeach(file)
 
     foreach(test ${BASIC_TESTS} ${TESTS_WITH_PROGRAM})
       add_executable(${test}_32 "${CMAKE_CURRENT_BINARY_DIR}/32/${test}.c")
       post_build_executable(${test}_32)
       add_dependencies(${test}_32 Generated)
-      set_target_properties(${test}_32 PROPERTIES LINK_FLAGS "-m32 ${CMAKE_C_FLAGS_DEBUG}")
+      set_target_properties(${test}_32 PROPERTIES LINK_FLAGS "-m32 ${RR_TEST_FLAGS}")
       target_link_libraries(${test}_32 -lrt -ldl)
-    endforeach(test)
-
-    foreach(test ${BASIC_CPP_TESTS})
-      add_executable(${test}_32 "${CMAKE_CURRENT_BINARY_DIR}/32/${test}.cc")
-      post_build_executable(${test}_32)
-      add_dependencies(${test}_32 Generated)
-      set_target_properties(${test}_32 PROPERTIES LINK_FLAGS "-m32 ${CMAKE_CXX_FLAGS_DEBUG}")
-      target_link_libraries(${test}_32 -lrt)
     endforeach(test)
 
     add_library(test_lib_32
@@ -1276,7 +1396,7 @@ if(BUILD_TESTS)
     set_target_properties(cpuid_32 PROPERTIES LINK_FLAGS -m32)
     target_link_libraries(cpuid_32 -lrt)
 
-    foreach(test ${BASIC_TESTS} ${BASIC_CPP_TESTS} ${OTHER_TESTS})
+    foreach(test ${BASIC_TESTS} ${OTHER_TESTS})
       add_test(${test}-32
         bash ${CMAKE_SOURCE_DIR}/src/test/basic_test.run ${test}_32 -b ${PROJECT_BINARY_DIR})
       configure_test(${test}-32)
@@ -1297,6 +1417,9 @@ if(BUILD_TESTS)
 
   set(CHAOS_TESTS
     core_count
+    futex_wakeup
+    getaffinity_core_count
+    pipe_wakeup
     mmap_adjacent
     mmap_bits
     starvation_multithreaded
@@ -1340,8 +1463,8 @@ set(CPACK_GENERATOR "TGZ;RPM;DEB")
 set(CPACK_SOURCE_GENERATOR "TGZ")
 set(CPACK_BINARY_DIR "${PROJECT_BINARY_DIR}")
 # Don't strip binaries. It's important/useful for librrpreload at least to
-# have debug symbols. I can't figure out an easy way to strip the rr binary
-# without stripping librrpreload.
+# have debug symbols. For package releases, pass -Dstrip=TRUE to strip symbols
+# from the rr binary at build time.
 set(CPACK_STRIP_FILES FALSE)
 
 set(CPACK_RESOURCE_FILE_LICENSE "${CMAKE_SOURCE_DIR}/LICENSE")

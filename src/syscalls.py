@@ -252,7 +252,7 @@ access = EmulatedSyscall(x86=33, x64=21)
 
 nice = UnsupportedSyscall(x86=34)
 ftime = InvalidSyscall(x86=35)
-sync = EmulatedSyscall(x86=36, x64=162)
+sync = IrregularEmulatedSyscall(x86=36, x64=162)
 
 #  int kill(pid_t pid, int sig)
 #
@@ -335,7 +335,7 @@ getgid = EmulatedSyscall(x86=47, x64=104)
 signal = UnsupportedSyscall(x86=48)
 geteuid = EmulatedSyscall(x86=49, x64=107)
 getegid = EmulatedSyscall(x86=50, x64=108)
-acct = UnsupportedSyscall(x86=51, x64=163)
+acct = EmulatedSyscall(x86=51, x64=163)
 umount2 = EmulatedSyscall(x86=52, x64=166)
 lock = InvalidSyscall(x86=53)
 
@@ -436,7 +436,7 @@ sethostname = EmulatedSyscall(x86=74, x64=170)
 # by other means.
 setrlimit = EmulatedSyscall(x86=75, x64=160)
 
-getrlimit = EmulatedSyscall(x64=97, arg2="typename Arch::rlimit")
+getrlimit = EmulatedSyscall(x86=76, x64=97, arg2="typename Arch::rlimit")
 
 #  int getrusage(int who, struct rusage *usage)
 #
@@ -605,7 +605,7 @@ ipc = IrregularEmulatedSyscall(x86=117)
 # device) where that file resides.  The call blocks until the device
 # reports that the transfer has completed.  It also flushes metadata
 # information associated with the file (see stat(2))
-fsync = EmulatedSyscall(x86=118, x64=74)
+fsync = IrregularEmulatedSyscall(x86=118, x64=74)
 
 #  int sigreturn(unsigned long __unused)
 #
@@ -694,7 +694,7 @@ getpgid = EmulatedSyscall(x86=132, x64=121)
 fchdir = EmulatedSyscall(x86=133, x64=81)
 
 bdflush = UnsupportedSyscall(x86=134)
-sysfs = UnsupportedSyscall(x86=135, x64=139)
+sysfs = IrregularEmulatedSyscall(x86=135, x64=139)
 personality = IrregularEmulatedSyscall(x86=136, x64=135)
 afs_syscall = InvalidSyscall(x86=137, x64=183)
 setfsuid = EmulatedSyscall(x86=138, x64=122)
@@ -741,7 +741,7 @@ flock = EmulatedSyscall(x86=143, x64=73)
 # munmap(2) is called.  To be more precise, the part of the file that
 # corresponds to the memory area starting at addr and having length
 # length is updated.
-msync = EmulatedSyscall(x86=144, x64=26)
+msync = IrregularEmulatedSyscall(x86=144, x64=26)
 
 #  ssize_t readv(int fd, const struct iovec *iov, int iovcnt);
 #
@@ -775,7 +775,7 @@ getsid = EmulatedSyscall(x86=147, x64=124)
 # handled correctly.  On the other hand, a change to the file size
 # (st_size, as made by say ftruncate(2)), would require a metadata
 # flush
-fdatasync = EmulatedSyscall(x86=148, x64=75)
+fdatasync = IrregularEmulatedSyscall(x86=148, x64=75)
 
 #  int _sysctl(struct __syscall_args* args);
 #
@@ -1473,12 +1473,12 @@ get_robust_list = EmulatedSyscall(x86=312, x64=274, arg2="typename Arch::unsigne
 # redirected during replay.  But, *crickets*.
 splice = IrregularEmulatedSyscall(x86=313, x64=275)
 
-sync_file_range = UnsupportedSyscall(x86=314, x64=277)
+sync_file_range = IrregularEmulatedSyscall(x86=314, x64=277)
 tee = UnsupportedSyscall(x86=315, x64=276)
 vmsplice = UnsupportedSyscall(x86=316, x64=278)
 move_pages = UnsupportedSyscall(x86=317, x64=279)
 getcpu = EmulatedSyscall(x86=318, x64=309, arg1="unsigned int", arg2="unsigned int")
-epoll_pwait = UnsupportedSyscall(x86=319, x64=281)
+epoll_pwait = IrregularEmulatedSyscall(x86=319, x64=281)
 
 #  int utimensat(int dirfd, const char *pathname, const struct timespec
 #times[2], int flags);
@@ -1617,7 +1617,7 @@ prlimit64 = EmulatedSyscall(x86=340, x64=302, arg4="typename Arch::rlimit64")
 name_to_handle_at = IrregularEmulatedSyscall(x86=341, x64=303)
 open_by_handle_at = EmulatedSyscall(x86=342, x64=304)
 clock_adjtime = UnsupportedSyscall(x86=343, x64=305)
-syncfs = EmulatedSyscall(x86=344, x64=306)
+syncfs = IrregularEmulatedSyscall(x86=344, x64=306)
 
 #  int sendmmsg(int sockfd, struct mmsghdr *msgvec, unsigned int vlen,
 #               unsigned int flags);
@@ -1641,14 +1641,53 @@ getrandom = IrregularEmulatedSyscall(x86=355, x64=318)
 memfd_create = IrregularEmulatedSyscall(x86=356, x64=319)
 arch_prctl = IrregularEmulatedSyscall(x86=384, x64=158)
 
-bpf = UnsupportedSyscall(x86=357, x64=321)
+bpf = IrregularEmulatedSyscall(x86=357, x64=321)
 execveat = UnsupportedSyscall(x86=358, x64=322)
 userfaultfd = UnsupportedSyscall(x86=374, x64=323)
 membarrier = EmulatedSyscall(x86=375, x64=324)
 mlock2 = UnsupportedSyscall(x86=376, x64=325)
-copy_file_range = UnsupportedSyscall(x86=377, x64=326)
+copy_file_range = IrregularEmulatedSyscall(x86=377, x64=326)
 preadv2 = UnsupportedSyscall(x86=378, x64=327)
 pwritev2 = UnsupportedSyscall(x86=379, x64=328)
+pkey_mprotect = UnsupportedSyscall(x86=380, x64=329)
+pkey_alloc = UnsupportedSyscall(x86=381, x64=330)
+pkey_free = UnsupportedSyscall(x86=382, x64=331)
+statx = EmulatedSyscall(x86=383, x64=332, arg5="typename Arch::statx_struct")
+io_pgetevents = UnsupportedSyscall(x86=385, x64=333)
+rseq = UnsupportedSyscall(x86=386, x64=334)
+
+clock_gettime64 = UnsupportedSyscall(x86=403)
+clock_settime64 = UnsupportedSyscall(x86=404)
+clock_adjtime64 = UnsupportedSyscall(x86=405)
+clock_getres_time64 = UnsupportedSyscall(x86=406)
+clock_nanosleep_time64 = UnsupportedSyscall(x86=407)
+timer_gettime64 = UnsupportedSyscall(x86=408)
+timer_settime64 = UnsupportedSyscall(x86=409)
+timerfd_gettime64 = UnsupportedSyscall(x86=410)
+timerfd_settime64 = UnsupportedSyscall(x86=411)
+utimensat_time64 = UnsupportedSyscall(x86=412)
+pselect6_time64 = UnsupportedSyscall(x86=413)
+ppoll_time64 = UnsupportedSyscall(x86=414)
+io_pgetevents_time64 = UnsupportedSyscall(x86=416)
+recvmmsg_time64 = UnsupportedSyscall(x86=417)
+mq_timedsend_time64 = UnsupportedSyscall(x86=418)
+mq_timedreceive_time64 = UnsupportedSyscall(x86=419)
+semtimedop_time64 = UnsupportedSyscall(x86=420)
+rt_sigtimedwait_time64 = UnsupportedSyscall(x86=421)
+futex_time64 = UnsupportedSyscall(x86=422)
+sched_rr_get_interval_time64 = UnsupportedSyscall(x86=423)
+
+# x86-64 decided to skip ahead here to catchup
+pidfd_send_signal = UnsupportedSyscall(x86=424, x64=424)
+io_uring_setup = UnsupportedSyscall(x86=425, x64=425)
+io_uring_enter = UnsupportedSyscall(x86=426, x64=426)
+io_uring_register = UnsupportedSyscall(x86=427, x64=427)
+open_tree = UnsupportedSyscall(x86=428, x64=428)
+move_mount = UnsupportedSyscall(x86=429, x64=429)
+fsopen = UnsupportedSyscall(x86=430, x64=430)
+fsconfig = UnsupportedSyscall(x86=431, x64=431)
+fsmount = UnsupportedSyscall(x86=432, x64=432)
+fspick = UnsupportedSyscall(x86=433, x64=433)
 
 # restart_syscall is a little special.
 restart_syscall = RestartSyscall(x86=0, x64=219)
@@ -1699,7 +1738,7 @@ epoll_ctl_old = UnsupportedSyscall(x64=214)
 epoll_wait_old = UnsupportedSyscall(x64=215)
 
 def _syscalls():
-    for name, obj in globals().iteritems():
+    for name, obj in globals().items():
         if isinstance(obj, BaseSyscall):
             yield name, obj
 

@@ -13,7 +13,6 @@ namespace rr {
 
 MmappedFileMonitor::MmappedFileMonitor(Task* t, int fd) {
   ASSERT(t, !t->session().is_replaying());
-  extant_ = true;
   dead_ = false;
   auto stat = t->stat_fd(fd);
   device_ = stat.st_dev;
@@ -23,13 +22,7 @@ MmappedFileMonitor::MmappedFileMonitor(Task* t, int fd) {
 MmappedFileMonitor::MmappedFileMonitor(Task* t, EmuFile::shr_ptr f) {
   ASSERT(t, t->session().is_replaying());
 
-  extant_ = !!f;
   dead_ = false;
-  if (!extant_) {
-    // Our only role is to disable syscall buffering for this fd.
-    return;
-  }
-
   device_ = f->device();
   inode_ = f->inode();
 }
@@ -43,7 +36,7 @@ void MmappedFileMonitor::did_write(Task* t, const std::vector<Range>& ranges,
     return;
   }
 
-  if (!extant_ || ranges.empty()) {
+  if (ranges.empty()) {
     return;
   }
 
@@ -65,6 +58,15 @@ void MmappedFileMonitor::did_write(Task* t, const std::vector<Range>& ranges,
         if (km.device() != device_ || km.inode() != inode_) {
           continue;
         }
+        // If the mapping is MAP_PRIVATE then this write is dangerous
+        // because it's unpredictable what will be seen in the mapping.
+        // However, it could be OK if the application doesn't read from
+        // this part of the mapping. Just optimistically assume this mapping
+        // is not affected.
+        if (!(km.flags() & MAP_SHARED)) {
+          LOG(warn) << "MAP_PRIVATE mapping affected by write";
+          continue;
+        }
       }
 
       // We're discovering a mapping we care about
@@ -74,7 +76,6 @@ void MmappedFileMonitor::did_write(Task* t, const std::vector<Range>& ranges,
       }
 
       // stat matches.
-      ASSERT(t, km.flags() & MAP_SHARED);
       uint64_t mapping_offset = km.file_offset_bytes();
       int64_t local_offset = realized_offset;
       for (auto r : ranges) {

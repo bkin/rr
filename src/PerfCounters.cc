@@ -29,12 +29,16 @@ using namespace std;
 
 namespace rr {
 
+#define PERF_COUNT_RR 0x72727272L
+
 static bool attributes_initialized;
+// At some point we might support multiple kinds of ticks for the same CPU arch.
+// At that point this will need to become more complicated.
 static struct perf_event_attr ticks_attr;
+static struct perf_event_attr minus_ticks_attr;
 static struct perf_event_attr cycles_attr;
-static struct perf_event_attr page_faults_attr;
 static struct perf_event_attr hw_interrupts_attr;
-static struct perf_event_attr instructions_retired_attr;
+static uint32_t pmu_flags;
 static uint32_t skid_size;
 static bool has_ioc_period_bug;
 static bool has_kvm_in_txcp_bug;
@@ -61,54 +65,71 @@ enum CpuMicroarch {
   IntelBroadwell,
   IntelSkylake,
   IntelSilvermont,
+  IntelGoldmont,
   IntelKabylake,
+  IntelCometlake,
+  AMDF15R30,
   AMDRyzen,
 };
+
+/*
+ * Set if this CPU supports ticks counting retired conditional branches.
+ */
+#define PMU_TICKS_RCB (1<<0)
+
+/*
+ * Some CPUs turn off the whole PMU when there are no remaining events
+ * scheduled (perhaps as a power consumption optimization). This can be a
+ * very expensive operation, and is thus best avoided. For cpus, where this
+ * is a problem, we keep a cycles counter (which corresponds to one of the
+ * fixed function counters, so we don't use up a programmable PMC) that we
+ * don't otherwise use, but keeps the PMU active, greatly increasing
+ * performance.
+ */
+#define PMU_BENEFITS_FROM_USELESS_COUNTER (1<<1)
+
+/*
+ * Whether to skip the check for Intel CPU bugs
+ */
+#define PMU_SKIP_INTEL_BUG_CHECK (1<<2)
+
+/*
+ * Set if this CPU supports ticks counting all taken branches
+ * (excluding interrupts, far branches, and rets).
+ */
+#define PMU_TICKS_TAKEN_BRANCHES (1<<3)
 
 struct PmuConfig {
   CpuMicroarch uarch;
   const char* name;
   unsigned rcb_cntr_event;
-  unsigned rinsn_cntr_event;
+  unsigned minus_ticks_cntr_event;
   unsigned hw_intr_cntr_event;
   uint32_t skid_size;
-  bool supported;
-  /*
-   * Some CPUs turn off the whole PMU when there are no remaining events
-   * scheduled (perhaps as a power consumption optimization). This can be a
-   * very expensive operation, and is thus best avoided. For cpus, where this
-   * is a problem, we keep a cycles counter (which corresponds to one of the
-   * fixed function counters, so we don't use up a programmable PMC) that we
-   * don't otherwise use, but keeps the PMU active, greatly increasing
-   * performance.
-   */
-  bool benefits_from_useless_counter;
+  uint32_t flags;
 };
 
 // XXX please only edit this if you really know what you're doing.
 static const PmuConfig pmu_configs[] = {
-  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0x5100c0, 0x5301cb, 100,
-    true, true },
-  { IntelSkylake, "Intel Skylake", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelHaswell, "Intel Haswell", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100, true,
-    false },
-  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0x5100c0, 0x5301cb, 100,
-    true, false },
-  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
-    false },
-  { IntelWestmere, "Intel Westmere", 0x5101c4, 0x5100c0, 0x50011d, 100, true,
-    false },
-  { IntelPenryn, "Intel Penryn", 0, 0, 0, 100, false, false },
-  { IntelMerom, "Intel Merom", 0, 0, 0, 100, false, false },
-  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0x5100c0, 0, 1000, true, false },
+  { IntelCometlake, "Intel Cometlake", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelKabylake, "Intel Kabylake", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelSilvermont, "Intel Silvermont", 0x517ec4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelGoldmont, "Intel Goldmont", 0x517ec4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelSkylake, "Intel Skylake", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelBroadwell, "Intel Broadwell", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelHaswell, "Intel Haswell", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelIvyBridge, "Intel Ivy Bridge", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelSandyBridge, "Intel Sandy Bridge", 0x5101c4, 0, 0x5301cb, 100, PMU_TICKS_RCB },
+  { IntelNehalem, "Intel Nehalem", 0x5101c4, 0, 0x50011d, 100, PMU_TICKS_RCB },
+  { IntelWestmere, "Intel Westmere", 0x5101c4, 0, 0x50011d, 100, PMU_TICKS_RCB },
+  { IntelPenryn, "Intel Penryn", 0, 0, 0, 100, 0 },
+  { IntelMerom, "Intel Merom", 0, 0, 0, 100, 0 },
+  { AMDF15R30, "AMD Family 15h Revision 30h", 0xc4, 0xc6, 0, 250,
+    PMU_TICKS_TAKEN_BRANCHES | PMU_SKIP_INTEL_BUG_CHECK },
+  { AMDRyzen, "AMD Ryzen", 0x5100d1, 0, 0, 1000, PMU_TICKS_RCB },
 };
+
+#define RR_SKID_MAX 1000
 
 static string lowercase(const string& s) {
   string c = s;
@@ -131,11 +152,22 @@ static CpuMicroarch get_cpu_microarch() {
         return pmu.uarch;
       }
     }
-    FATAL() << "Forced uarch " << Flags::get().forced_uarch << " isn't known.";
+    CLEAN_FATAL() << "Forced uarch " << Flags::get().forced_uarch
+                  << " isn't known.";
+  }
+
+  auto cpuid_vendor = cpuid(CPUID_GETVENDORSTRING, 0);
+  char vendor[13];
+  memcpy(&vendor[0], &cpuid_vendor.ebx, 4);
+  memcpy(&vendor[4], &cpuid_vendor.edx, 4);
+  memcpy(&vendor[8], &cpuid_vendor.ecx, 4);
+  vendor[12] = 0;
+  if (strcmp(vendor, "GenuineIntel") && strcmp(vendor, "AuthenticAMD")) {
+    CLEAN_FATAL() << "Unknown CPU vendor '" << vendor << "'";
   }
 
   auto cpuid_data = cpuid(CPUID_GETFEATURES, 0);
-  unsigned int cpu_type = (cpuid_data.eax & 0xF0FF0);
+  unsigned int cpu_type = cpuid_data.eax & 0xF0FF0;
   unsigned int ext_family = (cpuid_data.eax >> 20) & 0xff;
   switch (cpu_type) {
     case 0x006F0:
@@ -164,17 +196,27 @@ static CpuMicroarch get_cpu_microarch() {
     case 0x40660:
       return IntelHaswell;
     case 0x306D0:
+    case 0x40670:
     case 0x406F0:
     case 0x50660:
       return IntelBroadwell;
     case 0x406e0:
+    case 0x50650:
     case 0x506e0:
       return IntelSkylake;
+    case 0x30670:
+    case 0x406c0:
     case 0x50670:
       return IntelSilvermont;
+    case 0x506f0:
+      return IntelGoldmont;
     case 0x806e0:
     case 0x906e0:
       return IntelKabylake;
+    case 0xa0660:
+	return IntelCometlake;
+    case 0x30f00:
+      return AMDF15R30;
     case 0x00f10:
       if (ext_family == 8) {
         if (!Flags::get().suppress_environment_warnings) {
@@ -190,7 +232,15 @@ static CpuMicroarch get_cpu_microarch() {
     default:
       break;
   }
-  FATAL() << "CPU " << HEX(cpu_type) << " unknown.";
+
+  if (!strcmp(vendor, "AuthenticAMD")) {
+    CLEAN_FATAL()
+        << "AMD CPUs not supported.\n"
+        << "For Ryzen, see https://github.com/mozilla/rr/issues/2034.\n"
+        << "For post-Ryzen CPUs, please file a Github issue.";
+  } else {
+    CLEAN_FATAL() << "Intel CPU type " << HEX(cpu_type) << " unknown";
+  }
   return UnknownCpu; // not reached
 }
 
@@ -279,14 +329,17 @@ static void check_for_ioc_period_bug() {
 
 static const int NUM_BRANCHES = 500;
 
+volatile uint32_t accumulator_sink = 0;
+
 static void do_branches() {
   // Do NUM_BRANCHES conditional branches that can't be optimized out.
   // 'accumulator' is always odd and can't be zero
-  int accumulator = rand() * 2 + 1;
+  uint32_t accumulator = uint32_t(rand()) * 2 + 1;
   for (int i = 0; i < NUM_BRANCHES && accumulator; ++i) {
     accumulator = ((accumulator * 7) + 2) & 0xffffff;
   }
-  srand(accumulator);
+  // Use 'accumulator' so it can't be  optimized out.
+  accumulator_sink = accumulator;
 }
 
 static void check_for_kvm_in_txcp_bug() {
@@ -318,7 +371,7 @@ static void check_for_xen_pmi_bug() {
   if (fd.is_open()) {
     // Do NUM_BRANCHES conditional branches that can't be optimized out.
     // 'accumulator' is always odd and can't be zero
-    uint32_t accumulator = rand() * 2 + 1;
+    uint32_t accumulator = uint32_t(rand()) * 2 + 1;
     int raw_fd = fd;
     asm volatile(
 #if defined(__x86_64__)
@@ -436,7 +489,8 @@ static void check_for_xen_pmi_bug() {
     if (count == 0) {
       count = read_counter(fd);
     }
-    srand(accumulator);
+    // Use 'accumulator' so it can't be optimized out.
+    accumulator_sink = accumulator;
   }
 
   has_xen_pmi_bug = count > NUM_BRANCHES || count == -1;
@@ -526,44 +580,75 @@ static void init_attributes() {
   }
   DEBUG_ASSERT(pmu);
 
-  if (!pmu->supported) {
+  if (!(pmu->flags & (PMU_TICKS_RCB | PMU_TICKS_TAKEN_BRANCHES))) {
     FATAL() << "Microarchitecture `" << pmu->name << "' currently unsupported.";
   }
 
-  skid_size = pmu->skid_size;
-  init_perf_event_attr(&ticks_attr, PERF_TYPE_RAW, pmu->rcb_cntr_event);
-  init_perf_event_attr(&cycles_attr, PERF_TYPE_HARDWARE,
-                       PERF_COUNT_HW_CPU_CYCLES);
-  init_perf_event_attr(&instructions_retired_attr, PERF_TYPE_RAW,
-                       pmu->rinsn_cntr_event);
-  init_perf_event_attr(&hw_interrupts_attr, PERF_TYPE_RAW,
-                       pmu->hw_intr_cntr_event);
-  // libpfm encodes the event with this bit set, so we'll do the
-  // same thing.  Unclear if necessary.
-  hw_interrupts_attr.exclude_hv = 1;
-  init_perf_event_attr(&page_faults_attr, PERF_TYPE_SOFTWARE,
-                       PERF_COUNT_SW_PAGE_FAULTS);
+  if (running_under_rr()) {
+    init_perf_event_attr(&ticks_attr, PERF_TYPE_HARDWARE, PERF_COUNT_RR);
+    skid_size = RR_SKID_MAX;
+    pmu_flags = pmu->flags & (PMU_TICKS_RCB | PMU_TICKS_TAKEN_BRANCHES);
+  } else {
+    skid_size = pmu->skid_size;
+    pmu_flags = pmu->flags;
+    init_perf_event_attr(&ticks_attr, PERF_TYPE_RAW, pmu->rcb_cntr_event);
+    if (pmu->minus_ticks_cntr_event != 0) {
+      init_perf_event_attr(&minus_ticks_attr, PERF_TYPE_RAW,
+                           pmu->minus_ticks_cntr_event);
+    }
+    init_perf_event_attr(&cycles_attr, PERF_TYPE_HARDWARE,
+                         PERF_COUNT_HW_CPU_CYCLES);
+    init_perf_event_attr(&hw_interrupts_attr, PERF_TYPE_RAW,
+                         pmu->hw_intr_cntr_event);
+    // libpfm encodes the event with this bit set, so we'll do the
+    // same thing.  Unclear if necessary.
+    hw_interrupts_attr.exclude_hv = 1;
 
-  check_for_bugs();
-  /*
-   * For maintainability, and since it doesn't impact performance when not
-   * needed, we always activate this. If it ever turns out to be a problem,
-   * this can be set to pmu->benefits_from_useless_counter, instead.
-   *
-   * We also disable this counter when running under rr. Even though it's the
-   * same event for the same task as the outer rr, the linux kernel does not
-   * coalesce them and tries to schedule the new one on a general purpose PMC.
-   * On CPUs with only 2 general PMCs (e.g. KNL), we'd run out.
-   */
-  activate_useless_counter = has_ioc_period_bug && !running_under_rr();
+    if (!(pmu_flags & PMU_SKIP_INTEL_BUG_CHECK)) {
+      check_for_bugs();
+    }
+    /*
+     * For maintainability, and since it doesn't impact performance when not
+     * needed, we always activate this. If it ever turns out to be a problem,
+     * this can be set to pmu->flags & PMU_BENEFITS_FROM_USELESS_COUNTER,
+     * instead.
+     *
+     * We also disable this counter when running under rr. Even though it's the
+     * same event for the same task as the outer rr, the linux kernel does not
+     * coalesce them and tries to schedule the new one on a general purpose PMC.
+     * On CPUs with only 2 general PMCs (e.g. KNL), we'd run out.
+     */
+    activate_useless_counter = has_ioc_period_bug && !running_under_rr();
+  }
 }
 
-bool PerfCounters::is_ticks_attr(const perf_event_attr& attr) {
+bool PerfCounters::is_rr_ticks_attr(const perf_event_attr& attr) {
+  return attr.type == PERF_TYPE_HARDWARE && attr.config == PERF_COUNT_RR;
+}
+
+bool PerfCounters::supports_ticks_semantics(TicksSemantics ticks_semantics) {
   init_attributes();
-  perf_event_attr tmp_attr = attr;
-  tmp_attr.sample_period = 0;
-  tmp_attr.config &= ~IN_TXCP;
-  return memcmp(&ticks_attr, &tmp_attr, sizeof(attr)) == 0;
+  switch (ticks_semantics) {
+  case TICKS_RETIRED_CONDITIONAL_BRANCHES:
+    return (pmu_flags & PMU_TICKS_RCB) != 0;
+  case TICKS_TAKEN_BRANCHES:
+    return (pmu_flags & PMU_TICKS_TAKEN_BRANCHES) != 0;
+  default:
+    FATAL() << "Unknown ticks_semantics " << ticks_semantics;
+    return false;
+  }
+}
+
+TicksSemantics PerfCounters::default_ticks_semantics() {
+  init_attributes();
+  if (pmu_flags & PMU_TICKS_TAKEN_BRANCHES) {
+    return TICKS_TAKEN_BRANCHES;
+  }
+  if (pmu_flags & PMU_TICKS_RCB) {
+    return TICKS_RETIRED_CONDITIONAL_BRANCHES;
+  }
+  FATAL() << "Unsupported architecture";
+  return TICKS_TAKEN_BRANCHES;
 }
 
 uint32_t PerfCounters::skid_size() {
@@ -571,9 +656,11 @@ uint32_t PerfCounters::skid_size() {
   return rr::skid_size;
 }
 
-PerfCounters::PerfCounters(pid_t tid)
-    : tid(tid), started(false), counting(false) {
-  init_attributes();
+PerfCounters::PerfCounters(pid_t tid, TicksSemantics ticks_semantics)
+    : tid(tid), ticks_semantics_(ticks_semantics), started(false), counting(false) {
+  if (!supports_ticks_semantics(ticks_semantics)) {
+    FATAL() << "Ticks semantics " << ticks_semantics << " not supported";
+  }
 }
 
 static void make_counter_async(ScopedFd& fd, int signal) {
@@ -602,8 +689,12 @@ void PerfCounters::reset(Ticks ticks_period) {
     LOG(debug) << "Recreating counters with period " << ticks_period;
 
     struct perf_event_attr attr = rr::ticks_attr;
+    struct perf_event_attr minus_attr = rr::minus_ticks_attr;
     attr.sample_period = ticks_period;
     fd_ticks_interrupt = start_counter(tid, -1, &attr);
+    if (minus_attr.config != 0) {
+      fd_minus_ticks_measure = start_counter(tid, fd_ticks_interrupt, &minus_attr);
+    }
 
     if (!only_one_counter && supports_txcp) {
       if (has_kvm_in_txcp_bug) {
@@ -659,6 +750,14 @@ void PerfCounters::reset(Ticks ticks_period) {
     if (ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_ENABLE, 0)) {
       FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
     }
+    if (fd_minus_ticks_measure.is_open()) {
+      if (ioctl(fd_minus_ticks_measure, PERF_EVENT_IOC_RESET, 0)) {
+        FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
+      }
+      if (ioctl(fd_minus_ticks_measure, PERF_EVENT_IOC_ENABLE, 0)) {
+        FATAL() << "ioctl(PERF_EVENT_IOC_ENABLE) failed";
+      }
+    }
     if (fd_ticks_measure.is_open()) {
       if (ioctl(fd_ticks_measure, PERF_EVENT_IOC_RESET, 0)) {
         FATAL() << "ioctl(PERF_EVENT_IOC_RESET) failed";
@@ -695,6 +794,7 @@ void PerfCounters::stop() {
 
   fd_ticks_interrupt.close();
   fd_ticks_measure.close();
+  fd_minus_ticks_measure.close();
   fd_useless_counter.close();
   fd_ticks_in_transaction.close();
 }
@@ -708,6 +808,9 @@ void PerfCounters::stop_counting() {
     stop();
   } else {
     ioctl(fd_ticks_interrupt, PERF_EVENT_IOC_DISABLE, 0);
+    if (fd_minus_ticks_measure.is_open()) {
+      ioctl(fd_minus_ticks_measure, PERF_EVENT_IOC_DISABLE, 0);
+    }
     if (fd_ticks_measure.is_open()) {
       ioctl(fd_ticks_measure, PERF_EVENT_IOC_DISABLE, 0);
     }
@@ -715,6 +818,14 @@ void PerfCounters::stop_counting() {
       ioctl(fd_ticks_in_transaction, PERF_EVENT_IOC_DISABLE, 0);
     }
   }
+}
+
+Ticks PerfCounters::ticks_for_unconditional_indirect_branch(Task*) {
+  return (pmu_flags & PMU_TICKS_TAKEN_BRANCHES) ? 1 : 0;
+}
+
+Ticks PerfCounters::ticks_for_direct_call(Task*) {
+  return (pmu_flags & PMU_TICKS_TAKEN_BRANCHES) ? 1 : 0;
 }
 
 Ticks PerfCounters::read_ticks(Task* t) {
@@ -743,6 +854,10 @@ Ticks PerfCounters::read_ticks(Task* t) {
       (t->session().is_recording() ? recording_skid_size() : skid_size());
   uint64_t interrupt_val = read_counter(fd_ticks_interrupt);
   if (!fd_ticks_measure.is_open()) {
+    if (fd_minus_ticks_measure.is_open()) {
+      uint64_t minus_measure_val = read_counter(fd_minus_ticks_measure);
+      interrupt_val -= minus_measure_val;
+    }
     ASSERT(t, !counting_period || interrupt_val <= adjusted_counting_period)
         << "Detected " << interrupt_val << " ticks, expected no more than "
         << adjusted_counting_period;

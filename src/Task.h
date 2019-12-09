@@ -38,12 +38,12 @@ class RecordTask;
 class ReplaySession;
 class ScopedFd;
 class Session;
-class TaskGroup;
+class ThreadGroup;
 
 enum CloneFlags {
   /**
    * The child gets a semantic copy of all parent resources (and
-   * becomes a new task group).  This is the semantics of the
+   * becomes a new thread group).  This is the semantics of the
    * fork() syscall.
    */
   CLONE_SHARE_NOTHING = 0,
@@ -52,8 +52,8 @@ enum CloneFlags {
    * parent.
    */
   CLONE_SHARE_SIGHANDLERS = 1 << 0,
-  /** Child will join its parent's task group. */
-  CLONE_SHARE_TASK_GROUP = 1 << 1,
+  /** Child will join its parent's thread group. */
+  CLONE_SHARE_THREAD_GROUP = 1 << 1,
   /** Child will share its parent's address space. */
   CLONE_SHARE_VM = 1 << 2,
   /** Child will share its parent's file descriptor table. */
@@ -178,6 +178,10 @@ public:
    */
   struct stat stat_fd(int fd);
   /**
+   * Lstat |fd| in the context of this task's fd table.
+   */
+  struct stat lstat_fd(int fd);
+  /**
    * Open |fd| in the context of this task's fd table.
    */
   ScopedFd open_fd(int fd, int flags);
@@ -235,6 +239,11 @@ public:
 
   /** Return the current $ip of this. */
   remote_code_ptr ip() { return regs().ip(); }
+
+  /**
+   * Emulate a jump to a new IP, updating the ticks counter as appropriate.
+   */
+  void emulate_jump(remote_code_ptr);
 
   /**
    * Return true if this is at an arm-desched-event or
@@ -307,6 +316,11 @@ public:
    * Hook called by `did_waitpid`.
    */
   virtual void did_wait() {}
+  /**
+   * Return the pid of the task in its own pid namespace.
+   * Only RecordTasks actually change pid namespaces.
+   */
+  virtual pid_t own_namespace_tid() { return tid; }
 
   /**
    * Assuming ip() is just past a breakpoint instruction, adjust
@@ -317,8 +331,9 @@ public:
   /**
    * Assuming we've just entered a syscall, exit that syscall and reset
    * state to reenter the syscall just as it was called the first time.
+   * Returns false if we see the process exit instead.
    */
-  void exit_syscall_and_prepare_restart();
+  bool exit_syscall_and_prepare_restart();
 
   /**
    * We're currently in user-space with registers set up to perform a system
@@ -331,9 +346,10 @@ public:
    * We have observed entry to a syscall (either by PTRACE_EVENT_SECCOMP or
    * a syscall, depending on the value of Session::syscall_seccomp_ordering()).
    * Continue into the kernel to perform the syscall and stop at the
-   * PTRACE_SYSCALL syscall-exit trap.
+   * PTRACE_SYSCALL syscall-exit trap. Returns false if we see the process exit
+   * before that.
    */
-  void exit_syscall();
+  bool exit_syscall();
 
   /**
    * Return the "task name"; i.e. what |prctl(PR_GET_NAME)| or
@@ -465,7 +481,7 @@ public:
   bool set_debug_regs(const DebugRegs& regs);
 
   uintptr_t get_debug_reg(size_t regno);
-  void set_debug_reg(size_t regno, uintptr_t value);
+  bool set_debug_reg(size_t regno, uintptr_t value);
 
   /** Update the thread area to |addr|. */
   void set_thread_area(remote_ptr<struct ::user_desc> tls);
@@ -509,12 +525,12 @@ public:
 
   void clear_wait_status() { wait_status = WaitStatus(); }
 
-  /** Return the task group this belongs to. */
-  std::shared_ptr<TaskGroup> task_group() const { return tg; }
+  /** Return the thread group this belongs to. */
+  std::shared_ptr<ThreadGroup> thread_group() const { return tg; }
 
   /** Return the id of this task's recorded thread group. */
   pid_t tgid() const;
-  /** Return id of real OS task group. */
+  /** Return id of real OS thread group. */
   pid_t real_tgid() const;
 
   TaskUid tuid() const { return TaskUid(rec_tid, serial); }
@@ -564,6 +580,11 @@ public:
    * block.
    */
   bool try_wait();
+  /**
+   * Return true if an unexpected exit was already detected for this task and
+   * it is ready to be reported.
+   */
+  bool wait_unexpected_exit();
 
   /**
    * Currently we don't allow recording across uid changes, so we can
@@ -601,10 +622,11 @@ public:
   void write_mem(remote_ptr<T> child_addr, const T* val) = delete;
 
   template <typename T>
-  void write_mem(remote_ptr<T> child_addr, const T* val, int count) {
+  void write_mem(remote_ptr<T> child_addr, const T* val, int count,
+                 bool* ok = nullptr) {
     DEBUG_ASSERT(type_has_no_holes<T>());
     write_bytes_helper(child_addr, sizeof(*val) * count,
-                       static_cast<const void*>(val));
+                       static_cast<const void*>(val), ok);
   }
 
   /**
@@ -646,42 +668,21 @@ public:
 
   /**
    * Open /proc/[tid]/mem fd for our AddressSpace, closing the old one
-   * first.
-   * This never fails. If necessary we force the tracee to open the file
+   * first. If necessary we force the tracee to open the file
    * itself and smuggle the fd back to us.
+   * Returns false if the process no longer exists.
    */
-  void open_mem_fd();
+  bool open_mem_fd();
 
   /**
    * Calls open_mem_fd if this task's AddressSpace doesn't already have one.
    */
   void open_mem_fd_if_needed();
 
-  /**
-   * Look up a TLS address for this thread.  |offset| and
-   * |load_module| are as specified in the qGetTLSAddr packet.  If the
-   * address is found, set |*result| and return true.  Otherwise,
-   * return false.
-   */
-  bool get_tls_address(size_t offset, remote_ptr<void> load_module,
-                       remote_ptr<void>* result);
-
-  /**
-   * Indicate that the symbol |name| has the given address.
-   */
-  void register_symbol(const std::string& name, remote_ptr<void> address);
-
-  /**
-   * Return a set of the names of all the symbols that might be needed
-   * by libthread_db.  Also clears the current mapping of symbol names
-   * to addresses.
-   */
-  const std::set<std::string> get_symbols_and_clear_map();
-
   /* True when any assumptions made about the status of this
    * process have been invalidated, and must be re-established
    * with a waitpid() call. Only applies to tasks which are dying, usually
-   * due to a signal sent to the entire task group. */
+   * due to a signal sent to the entire thread group. */
   bool unstable;
   /* exit(), or exit_group() with one task, has been called, so
    * the exit can be treated as stable. */
@@ -769,6 +770,7 @@ public:
                                  : scratch_ptr + scratch_size;
   }
   void setup_preload_thread_locals();
+  void setup_preload_thread_locals_from_clone(Task* origin);
   const ThreadLocals& fetch_preload_thread_locals();
   void activate_preload_thread_locals();
 
@@ -847,6 +849,11 @@ protected:
    * Internal method called after the first wait() during a clone().
    */
   virtual void post_wait_clone(Task*, int) {}
+
+  /**
+   * Internal method called after the clone to fix up the new address space.
+   */
+  virtual bool post_vm_clone(CloneReason reason, int flags, Task* origin);
 
   template <typename Arch>
   void on_syscall_exit_arch(int syscallno, const Registers& regs);
@@ -963,11 +970,14 @@ protected:
    * readable from the other end of the pipe whose write end is error_fd.
    */
   static Task* spawn(Session& session, const ScopedFd& error_fd,
-                     const TraceStream& trace, const std::string& exe_path,
+                     ScopedFd* sock_fd_out, int* tracee_socket_fd_number_out,
+                     TraceStream& trace, const std::string& exe_path,
                      const std::vector<std::string>& argv,
                      const std::vector<std::string>& envp, pid_t rec_tid = -1);
 
   void maybe_workaround_singlestep_bug();
+
+  void* preload_thread_locals();
 
   uint32_t serial;
   // The address space of this task.
@@ -1006,8 +1016,8 @@ protected:
   bool extra_registers_known;
   // The session we're part of.
   Session* session_;
-  // The task group this belongs to.
-  std::shared_ptr<TaskGroup> tg;
+  // The thread group this belongs to.
+  std::shared_ptr<ThreadGroup> tg;
   // Entries set by |set_thread_area()| or the |tls| argument to |clone()|
   // (when that's a user_desc). May be more than one due to different
   // entry_numbers.

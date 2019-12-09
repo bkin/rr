@@ -3,6 +3,8 @@
 #ifndef RR_LOG_H
 #define RR_LOG_H
 
+#include <features.h>
+
 #include <iostream>
 #include <type_traits>
 #include <vector>
@@ -12,6 +14,19 @@ namespace rr {
 class Task;
 
 enum LogLevel { LOG_fatal, LOG_error, LOG_warn, LOG_info, LOG_debug };
+
+/* A log module is just a string where any uppercase ASCII characters have
+ * been lowercased. We assign a LogLevel for each log module; this assignment
+ * can be configured via the `RR_LOG` environment variable and also modified
+ * dynamically.
+ *
+ * We derive a log module name from a source file name (typically given in
+ * __FILE__) by chopping off any directory parts and chopping off the trailing
+ * file extension (if any), and lowercasing any uppercase ASCII characters.
+ * e.g. <rr-dir>/src/Task.cc becomes the log module "task".
+ *
+ * This logging infrastructure is not thread safe. Use only on the main thread.
+ */
 
 /**
  * Return the ostream to which log data will be written.
@@ -34,11 +49,24 @@ std::ostream& operator<<(std::ostream& stream,
 std::ostream& operator<<(std::ostream& stream,
                          const std::vector<uint8_t>& bytes);
 
+/**
+ * Check whether logging is enabled for the given source file.
+ * `file` must be a pointer that is valid forever, preferably
+ * some value of `__FILE__`.
+ */
 bool is_logging_enabled(LogLevel level, const char* file);
 
+/**
+ * Flush the current log message in log_stream() to the log
+ * output file or circular buffer.
+ */
 void flush_log_buffer();
 
 struct NewlineTerminatingOstream {
+  /**
+   * `file` must be a pointer that is valid forever, preferably
+   * some value of `__FILE__`.
+   */
   NewlineTerminatingOstream(LogLevel level, const char* file, int line,
                             const char* function);
   ~NewlineTerminatingOstream();
@@ -56,6 +84,30 @@ const NewlineTerminatingOstream& operator<<(
 }
 // TODO: support stream modifiers.
 
+/**
+ * Print clean fatal errors. These include the file, line and function name
+ * but not errno or a stack trace. They go to stderr instead of the log file.
+ */
+struct CleanFatalOstream {
+  /**
+   * `file` must be a pointer that is valid forever, preferably
+   * some value of `__FILE__`.
+   */
+  CleanFatalOstream(const char* file, int line, const char* function);
+  ~CleanFatalOstream();
+};
+template <typename T>
+const CleanFatalOstream& operator<<(const CleanFatalOstream& stream,
+                                    const T& v) {
+  std::cerr << v;
+  return stream;
+}
+
+/**
+ * Print detailed fatal errors. These include the file, line and function name
+ * plus errno and a stack trace. Used for fatal errors where detailed
+ * diagnostics may be required.
+ */
 struct FatalOstream {
   FatalOstream(const char* file, int line, const char* function);
   ~FatalOstream();
@@ -67,6 +119,10 @@ const FatalOstream& operator<<(const FatalOstream& stream, const T& v) {
 }
 
 struct EmergencyDebugOstream {
+  /**
+   * `file` must be a pointer that is valid forever, preferably
+   * some value of `__FILE__`.
+   */
   EmergencyDebugOstream(bool cond, const Task* t, const char* file, int line,
                         const char* function, const char* cond_str);
   ~EmergencyDebugOstream();
@@ -93,6 +149,8 @@ const EmergencyDebugOstream& operator<<(const EmergencyDebugOstream& stream,
 
 /** A fatal error has occurred.  Log the error and exit. */
 #define FATAL() FatalOstream(__FILE__, __LINE__, __FUNCTION__)
+
+#define CLEAN_FATAL() CleanFatalOstream(__FILE__, __LINE__, __FUNCTION__)
 
 #ifndef __has_builtin
 #define __has_builtin(x) 0

@@ -14,8 +14,10 @@
 #include "Command.h"
 #include "Flags.h"
 #include "RecordCommand.h"
+#include "ReplayCommand.h"
 #include "core.h"
 #include "log.h"
+#include "util.h"
 
 using namespace std;
 
@@ -23,6 +25,7 @@ namespace rr {
 
 // Show version and quit.
 static bool show_version = false;
+static bool show_cmd_list = false;
 
 void assert_prerequisites(bool use_syscall_buffer) {
   struct utsname uname_buf;
@@ -49,8 +52,15 @@ void print_version(FILE* out) { fprintf(out, "rr version %s\n", RR_VERSION); }
 
 void print_global_options(FILE* out) {
   fputs(
-      "Common options:\n"
+      "Global options:\n"
       "  --disable-cpuid-faulting   disable use of CPUID faulting\n"
+      "  --disable-ptrace-exit_events disable use of PTRACE_EVENT_EXIT\n"
+      "  --resource-path=PATH       specify the paths that rr should use to "
+      "find\n"
+      "                             files such as rr_page_*.  These files "
+      "should\n"
+      "                             be located in PATH/bin, PATH/lib[64], and\n"
+      "                             PATH/share as appropriate.\n"
       "  -A, --microarch=<NAME>     force rr to assume it's running on a CPU\n"
       "                             with microarch NAME even if runtime "
       "detection\n"
@@ -98,17 +108,25 @@ void print_global_options(FILE* out) {
       out);
 }
 
+void list_commands(FILE* out) {
+  Command::print_help_all(out);
+}
+
 void print_usage(FILE* out) {
   print_version(out);
-  fputs("Usage:\n", out);
-  Command::print_help_all(out);
-  fputc('\n', out);
+  fputs("\nUsage:\n", out);
+  list_commands(out);
+  fputs("\nIf no subcommand is provided, we check if the first non-option\n"
+        "argument is a directory. If it is, we assume the 'replay' subcommand\n"
+        "otherwise we assume the 'record' subcommand.\n\n",
+        out);
   print_global_options(out);
 }
 
 static void init_random() {
   // Not very good, but good enough for our non-security-sensitive needs.
-  int key = time(nullptr) ^ getpid();
+  int key;
+  good_random(&key, sizeof(key));
   srandom(key);
   srand(key);
 }
@@ -116,17 +134,19 @@ static void init_random() {
 bool parse_global_option(std::vector<std::string>& args) {
   static const OptionSpec options[] = {
     { 0, "disable-cpuid-faulting", NO_PARAMETER },
+    { 1, "disable-ptrace-exit-events", NO_PARAMETER },
+    { 2, "resource-path", HAS_PARAMETER },
     { 'A', "microarch", HAS_PARAMETER },
     { 'C', "checksum", HAS_PARAMETER },
     { 'D', "dump-on", HAS_PARAMETER },
     { 'E', "fatal-errors", NO_PARAMETER },
     { 'F', "force-things", NO_PARAMETER },
     { 'K', "check-cached-mmaps", NO_PARAMETER },
+    { 'L', "list-commands", NO_PARAMETER },
     { 'M', "mark-stdio", NO_PARAMETER },
     { 'N', "version", NO_PARAMETER },
     { 'S', "suppress-environment-warnings", NO_PARAMETER },
     { 'T', "dump-at", HAS_PARAMETER },
-    { 'U', "cpu-unbound", NO_PARAMETER },
   };
 
   ParsedOption opt;
@@ -138,6 +158,15 @@ bool parse_global_option(std::vector<std::string>& args) {
   switch (opt.short_name) {
     case 0:
       flags.disable_cpuid_faulting = true;
+      break;
+    case 1:
+      flags.disable_ptrace_exit_events = true;
+      break;
+    case 2:
+      flags.resource_path = opt.value;
+      if (flags.resource_path.back() != '/') {
+        flags.resource_path.append("/");
+      }
       break;
     case 'A':
       flags.forced_uarch = opt.value;
@@ -182,6 +211,9 @@ bool parse_global_option(std::vector<std::string>& args) {
     case 'N':
       show_version = true;
       break;
+    case 'L':
+      show_cmd_list = true;
+      break;
     default:
       DEBUG_ASSERT(0 && "Invalid flag");
   }
@@ -194,6 +226,7 @@ using namespace rr;
 
 int main(int argc, char* argv[]) {
   init_random();
+  raise_resource_limits();
 
   vector<string> args;
   for (int i = 1; i < argc; ++i) {
@@ -205,6 +238,10 @@ int main(int argc, char* argv[]) {
 
   if (show_version) {
     print_version(stdout);
+    return 0;
+  }
+  if (show_cmd_list) {
+    list_commands(stdout);
     return 0;
   }
 
@@ -221,7 +258,11 @@ int main(int argc, char* argv[]) {
       print_usage(stderr);
       return 1;
     }
-    command = RecordCommand::get();
+    if (is_directory(args[0].c_str())) {
+      command = ReplayCommand::get();
+    } else {
+      command = RecordCommand::get();
+    }
   }
 
   return command->run(args);

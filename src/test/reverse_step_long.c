@@ -37,10 +37,12 @@ static void* do_thread(__attribute__((unused)) void* p) {
 int main(void) {
   pthread_t thread;
 
+  signal(SIGTTIN, SIG_IGN);
+
   pthread_create(&thread, NULL, do_thread, NULL);
 
   spin();
 
-  atomic_printf("EXIT-SUCCESS\n");
+  atomic_puts("EXIT-SUCCESS");
   return 0;
 }

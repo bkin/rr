@@ -328,8 +328,11 @@ static void rewrite_mmaps(const map<string, string>& file_map,
   while (true) {
     TraceReader::MappedData data;
     bool found;
+    vector<TraceRemoteFd> extra_fds;
+    bool skip_monitoring_mapped_fd;
     KernelMapping km = trace.read_mapped_region(
-        &data, &found, TraceReader::VALIDATE, TraceReader::ANY_TIME);
+        &data, &found, TraceReader::VALIDATE, TraceReader::ANY_TIME,
+        &extra_fds, &skip_monitoring_mapped_fd);
     if (!found) {
       break;
     }
@@ -340,7 +343,8 @@ static void rewrite_mmaps(const map<string, string>& file_map,
       }
       data.file_name = m->second;
     }
-    TraceWriter::write_mapped_region_to_alternative_stream(writer, data, km);
+    TraceWriter::write_mapped_region_to_alternative_stream(
+        writer, data, km, extra_fds, skip_monitoring_mapped_fd);
   }
 
   // Try not to lose data!
@@ -396,13 +400,28 @@ static void delete_unnecessary_files(const map<string, string>& file_map,
 }
 
 static int pack(const string& trace_dir) {
+  string dir;
+  {
+    // validate trace and produce default trace directory if trace_dir is empty
+    TraceReader reader(trace_dir);
+    dir = reader.dir();
+  }
+
   char buf[PATH_MAX];
-  realpath(trace_dir.c_str(), buf);
+  char* ret = realpath(dir.c_str(), buf);
+  if (!ret) {
+    FATAL() << "realpath failed on " << dir;
+  }
   string abspath(buf);
   map<string, string> canonical_mmapped_files =
       compute_canonical_mmapped_files(abspath);
   rewrite_mmaps(canonical_mmapped_files, abspath);
   delete_unnecessary_files(canonical_mmapped_files, abspath);
+
+  if (!probably_not_interactive(STDOUT_FILENO)) {
+    printf("rr: Packed trace directory `%s'.\n", dir.c_str());
+  }
+
   return 0;
 }
 

@@ -1,8 +1,13 @@
-#!/usr/bin/env python2
+#!/usr/bin/env python3
 
 import io
 import os
 import sys
+
+# Currently the rr page is not copied into the trace. If you want to change
+# the contents of the rr page, think carefully about trace compatibility.
+# One option would be to save the (replay) rr page into the trace and have
+# replay default to the old rr page if the saved page is not present.
 
 def write_rr_page(f, is_64, is_replay):
     # The length of each code sequence must be RR_PAGE_SYSCALL_STUB_SIZE.
@@ -69,7 +74,7 @@ def main(argv):
     base = os.path.basename(filename)
 
     if os.access(filename, os.F_OK):
-        with open(filename, 'r') as f:
+        with open(filename, 'rb') as f:
             before = f.read()
     else:
         before = ""
@@ -80,7 +85,7 @@ def main(argv):
     stream.close()
 
     if before != after:
-        with open(filename, 'w') as f:
+        with open(filename, 'wb') as f:
             f.write(after)
 
 if __name__ == '__main__':

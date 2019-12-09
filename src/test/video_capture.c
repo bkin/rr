@@ -62,7 +62,14 @@ static void init_device(int fd) {
   enum v4l2_buf_type type;
 
   fmt.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
-  test_assert(0 == ioctl(fd, VIDIOC_G_FMT, &fmt));
+  ret = ioctl(fd, VIDIOC_G_FMT, &fmt);
+  if (ret < 0 && errno == EINVAL) {
+    // v4l2_loopback doesn't support G_FMT
+    atomic_printf("%s does not support G_FMT; aborting test\n",
+                  device_name);
+    no_v4l2();
+  }
+  test_assert(0 == ret);
   atomic_printf("%s returning %dx%d frames\n", device_name, fmt.fmt.pix.width,
                 fmt.fmt.pix.height);
 
@@ -95,6 +102,9 @@ static void init_device(int fd) {
     buf->mmap_data = mmap(NULL, buf->vbuf.length, PROT_READ | PROT_WRITE,
                           MAP_SHARED, fd, buf->vbuf.m.offset);
     test_assert(buf->mmap_data != MAP_FAILED);
+    atomic_printf("Buffer %d, addr %p, device offset 0x%llx, device len 0x%llx\n",
+                  (int)i, buf->mmap_data, (long long)buf->vbuf.m.offset,
+                  (long long)buf->vbuf.length);
     test_assert(0 == ioctl(fd, VIDIOC_QBUF, &buf->vbuf));
   }
   type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
@@ -184,6 +194,7 @@ static void read_frames(int fd) {
     struct v4l2_buffer buf;
     int ret;
     size_t bytes;
+    struct buffer* buffer;
 
     buf.type = V4L2_BUF_TYPE_VIDEO_CAPTURE;
     buf.memory = V4L2_MEMORY_MMAP;
@@ -192,11 +203,22 @@ static void read_frames(int fd) {
     test_assert(buf.index < buffer_count);
 
     bytes = buf.length < 16 ? buf.length : 16;
-    atomic_printf("Frame %d: buffer %d: ", (int)i, (int)buf.index);
+    buffer = &buffers[buf.index];
+    atomic_printf("Frame %d, buffer %d, addr %p: ", (int)i, (int)buf.index,
+                  buffer->mmap_data);
     for (j = 0; j < bytes; ++j) {
-      atomic_printf("%2x ", buffers[buf.index].mmap_data[j]);
+      atomic_printf("%2x ", buffer->mmap_data[j]);
     }
     atomic_printf("...\n");
+
+    /* Reallocate the mmap data to check for bugs involving the length
+       of the shared memory area */
+    munmap(buffer->mmap_data, buffer->vbuf.length);
+    buffer->mmap_data =
+      mmap(NULL, buffer->vbuf.length, PROT_READ | PROT_WRITE, MAP_SHARED,
+           fd, buffer->vbuf.m.offset);
+    test_assert(buffer->mmap_data != MAP_FAILED);
+
     test_assert(0 == ioctl(fd, VIDIOC_QBUF, &buf));
   }
 }

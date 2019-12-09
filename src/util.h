@@ -3,7 +3,8 @@
 #ifndef RR_UTIL_H_
 #define RR_UTIL_H_
 
-#include "signal.h"
+#include <signal.h>
+#include <stdio.h>
 
 #include <array>
 #include <map>
@@ -15,6 +16,12 @@
 #include "TraceFrame.h"
 #include "remote_ptr.h"
 
+/* This is pretty arbitrary. On Linux SIGPWR is sent to PID 1 (init) on
+ * power failure, and it's unlikely rr will be recording that.
+ * Note that SIGUNUSED means SIGSYS which actually *is* used (by seccomp),
+ * so we can't use it. */
+#define SYSCALLBUF_DEFAULT_DESCHED_SIGNAL SIGPWR
+
 namespace rr {
 
 /*
@@ -25,12 +32,22 @@ namespace rr {
  * place can move out of this file.
  */
 
-class Event;
+struct Event;
 class KernelMapping;
 class Task;
 class TraceFrame;
 
 enum Completion { COMPLETE, INCOMPLETE };
+
+/**
+ * Returns a vector containing the raw data you can get from getauxval.
+ */
+std::vector<uint8_t> read_auxv(Task* t);
+
+/**
+ * Returns a vector containing the environment strings.
+ */
+std::vector<std::string> read_env(Task* t);
 
 /**
  * Create a file named |filename| and dump |buf_len| words in |buf| to
@@ -119,8 +136,7 @@ signal_action default_action(int sig);
 SignalDeterministic is_deterministic_signal(Task* t);
 
 /**
- * Return nonzero if a mapping of |filename| with metadata |stat|,
- * using |flags| and |prot|, should almost certainly be copied to
+ * Return nonzero if a mapping of |mapping| should almost certainly be copied to
  * trace; i.e., the file contents are likely to change in the interval
  * between recording and replay.  Zero is returned /if we think we can
  * get away/ with not copying the region.  That doesn't mean it's
@@ -160,6 +176,7 @@ enum cpuid_requests {
 const int OSXSAVE_FEATURE_FLAG = 1 << 27;
 const int AVX_FEATURE_FLAG = 1 << 28;
 const int HLE_FEATURE_FLAG = 1 << 4;
+const int XSAVEC_FEATURE_FLAG = 1 << 1;
 
 /** issue a single request to CPUID. Fits 'intel features', for instance
  *  note that even if only "eax" and "edx" are of interest, other registers
@@ -172,6 +189,18 @@ struct CPUIDData {
 };
 CPUIDData cpuid(uint32_t code, uint32_t subrequest);
 
+/**
+ * Check OSXSAVE flag.
+ */
+bool xsave_enabled();
+/**
+ * Fetch current XCR0 value using XGETBV instruction.
+ */
+uint64_t xcr0();
+
+/**
+ * Return all CPUID values supported by this CPU.
+ */
 struct CPUIDRecord {
   uint32_t eax_in;
   // UINT32_MAX means ECX not relevant
@@ -180,7 +209,24 @@ struct CPUIDRecord {
 };
 std::vector<CPUIDRecord> all_cpuid_records();
 
+/**
+ * Returns true if CPUID faulting is supported by the kernel and hardware and
+ * is actually working.
+ */
 bool cpuid_faulting_works();
+
+/**
+ * Locate a CPUID record for the give parameters, or return nullptr if there
+ * isn't one.
+ */
+const CPUIDRecord* find_cpuid_record(const std::vector<CPUIDRecord>& records,
+                                     uint32_t eax, uint32_t ecx);
+
+/**
+ * Return true if the trace's CPUID values are "compatible enough" with our
+ * CPU's CPUID values.
+ */
+bool cpuid_compatible(const std::vector<CPUIDRecord>& trace_records);
 
 struct CloneParameters {
   remote_ptr<void> stack;
@@ -210,7 +256,7 @@ void dump_task_map(const std::map<pid_t, Task*>& tasks);
 
 std::string real_path(const std::string& path);
 
-std::string exe_directory();
+std::string resource_path();
 
 /**
  * Get the current time from the preferred monotonic clock in units of
@@ -224,13 +270,15 @@ std::vector<std::string> read_proc_status_fields(pid_t tid, const char* name,
                                                  const char* name2 = nullptr,
                                                  const char* name3 = nullptr);
 
+bool is_zombie_process(pid_t pid);
+
 /**
  * Mainline Linux kernels use an invisible (to /proc/<pid>/maps) guard page
  * for stacks. grsecurity kernels don't.
  */
 bool uses_invisible_guard_page();
 
-void copy_file(Task* t, int dest_fd, int src_fd);
+bool copy_file(int dest_fd, int src_fd);
 
 #if defined(__has_feature)
 #if __has_feature(memory_sanitizer)
@@ -248,12 +296,6 @@ inline void msan_unpoison(void* ptr, size_t n) {
   (void)n;
 };
 #endif
-
-/**
- * Allocate new memory of |size| in bytes. The pointer returned is never NULL.
- * This calls aborts the program if the host runs out of memory.
- */
-void* xmalloc(size_t size);
 
 /**
  * Determine if the given capabilities are a subset of the process' current
@@ -289,8 +331,6 @@ inline size_t xsave_area_size() { return xsave_native_layout().full_size; }
 
 inline sig_set_t signal_bit(int sig) { return sig_set_t(1) << (sig - 1); }
 
-uint64_t rr_signal_mask();
-
 inline bool is_kernel_trap(int si_code) {
   /* XXX unable to find docs on which of these "should" be
    * right.  The SI_KERNEL code is seen in the int3 test, so we
@@ -319,7 +359,15 @@ void dump_rr_stack();
 void check_for_leaks();
 
 /**
- * Returns $TMPDIR or "/tmp".
+ * Create directory `str`, creating parent directories as needed.
+ * `dir_type` is printed in error messages. Fails if the resulting directory
+ * is not writeable.
+ */
+void ensure_dir(const std::string& dir, const char* dir_type, mode_t mode);
+
+/**
+ * Returns $TMPDIR or "/tmp". We call ensure_dir to make sure the directory
+ * exists and is writeable.
  */
 const char* tmp_dir();
 
@@ -341,18 +389,19 @@ std::vector<std::string> current_env();
 
 int get_num_cpus();
 
-enum class DisabledInsn {
+enum class TrappedInstruction {
   NONE = 0,
   RDTSC = 1,
   RDTSCP = 2,
   CPUID = 3,
+  INT3 = 4,
 };
 
 /* If |t->ip()| points at a disabled instruction, return the instruction */
-DisabledInsn disabled_insn_at(Task* t, remote_code_ptr ip);
+TrappedInstruction trapped_instruction_at(Task* t, remote_code_ptr ip);
 
-/* Return the length of the DisabledInsn */
-size_t disabled_insn_len(DisabledInsn insn);
+/* Return the length of the TrappedInstruction */
+size_t trapped_instruction_len(TrappedInstruction insn);
 
 /**
  * BIND_CPU means binding to a randomly chosen CPU.
@@ -368,6 +417,45 @@ int choose_cpu(BindCPU bind_cpu);
  * |buf|.  Pre- and post-conditioning is not performed in this function and so
  * should be performed by the caller, as required. */
 uint32_t crc32(uint32_t crc, unsigned char* buf, size_t len);
+
+/* Like write(2) but any error or "device full" is treated as fatal. We also
+ * ensure that all bytes are written by looping on short writes. */
+void write_all(int fd, const void* buf, size_t size);
+
+/* Like pwrite64(2) but we try to write all bytes by looping on short writes. */
+ssize_t pwrite_all_fallible(int fd, const void* buf, size_t size, off_t offset);
+
+/* Returns true if |path| is an accessible directory. Returns false if there
+ * was an error.
+ */
+bool is_directory(const char* path);
+
+/**
+ * Read bytes from `fd` into `buf` from `offset` until the read returns an
+ * error or 0 or the buffer is full. Returns total bytes read or -1 for error.
+ */
+ssize_t read_to_end(const ScopedFd& fd, size_t offset, void* buf, size_t size);
+
+/**
+ * Raise resource limits, in particular the open file descriptor count.
+ */
+void raise_resource_limits();
+
+/**
+ * Restore the initial resource limits for this process.
+ */
+void restore_initial_resource_limits();
+
+/**
+ * Return the word size for the architecture.
+ */
+size_t word_size(SupportedArch arch);
+
+/**
+ * Print JSON-escaped version of the string, including double-quotes.
+ */
+std::string json_escape(const std::string& str, size_t pos = 0);
+
 } // namespace rr
 
 #endif /* RR_UTIL_H_ */

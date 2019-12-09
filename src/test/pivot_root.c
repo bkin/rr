@@ -5,16 +5,16 @@
 
 int main(void) {
   if (-1 == try_setup_ns(CLONE_NEWNS)) {
-    atomic_printf("EXIT-SUCCESS");
+    atomic_puts("EXIT-SUCCESS");
     return 0;
   }
 
   /* Set up a directory structure for testing */
   test_assert(0 == mkdir("old_root", 0700));
-  test_assert(0 == mount("", "old_root", "tmpfs", 0, NULL));
+  test_assert(0 == mount("none", "old_root", "tmpfs", 0, NULL));
 
   test_assert(0 == mkdir("old_root/new_root", 0700));
-  test_assert(0 == mount("", "old_root/new_root", "tmpfs", 0, NULL));
+  test_assert(0 == mount("none", "old_root/new_root", "tmpfs", 0, NULL));
 
   test_assert(0 == mkdir("old_root/new_root/new_old_root", 0700));
 
@@ -39,6 +39,6 @@ int main(void) {
   test_assert(0 == stat("new_root.txt", &buf));
   test_assert(0 == stat("new_old_root/old_root.txt", &buf));
 
-  atomic_printf("EXIT-SUCCESS");
+  atomic_puts("EXIT-SUCCESS");
   return 0;
 }

@@ -2,6 +2,8 @@
 
 #include "Monkeypatcher.h"
 
+#include <limits.h>
+
 #include <sstream>
 
 #include "AddressSpace.h"
@@ -161,8 +163,7 @@ void substitute_extended_jump<X64SyscallStubExtendedJump>(
 template <typename ExtendedJumpPatch>
 static remote_ptr<uint8_t> allocate_extended_jump(
     RecordTask* t, vector<Monkeypatcher::ExtendedJumpPage>& pages,
-    remote_ptr<uint8_t> from_end, remote_code_ptr return_addr,
-    remote_code_ptr target_addr) {
+    remote_ptr<uint8_t> from_end) {
   Monkeypatcher::ExtendedJumpPage* page = nullptr;
   for (auto& p : pages) {
     remote_ptr<uint8_t> page_jump_start = p.addr + p.allocated;
@@ -203,6 +204,7 @@ static remote_ptr<uint8_t> allocate_extended_jump(
                    &recorded);
       t->vm()->mapping_flags_of(addr) |= AddressSpace::Mapping::IS_PATCH_STUBS;
       t->trace_writer().write_mapped_region(t, recorded, recorded.fake_stat(),
+                                            vector<TraceRemoteFd>(),
                                             TraceWriter::PATCH_MAPPING);
     }
 
@@ -210,25 +212,19 @@ static remote_ptr<uint8_t> allocate_extended_jump(
     page = &pages.back();
   }
 
-  uint8_t jump_patch[ExtendedJumpPatch::size];
   remote_ptr<uint8_t> jump_addr = page->addr + page->allocated;
-  substitute_extended_jump<ExtendedJumpPatch>(jump_patch, jump_addr.as_int(),
-                                              return_addr.register_value(),
-                                              target_addr.register_value());
-  write_and_record_bytes(t, jump_addr, jump_patch);
-  page->allocated += sizeof(jump_patch);
+  page->allocated += ExtendedJumpPatch::size;
   return jump_addr;
 }
 
 bool Monkeypatcher::is_jump_stub_instruction(remote_code_ptr ip) {
-  remote_ptr<void> pp = ip.to_data_ptr<void>();
-  for (auto& p : extended_jump_pages) {
-    if (p.addr <= pp.cast<uint8_t>() &&
-        pp.cast<uint8_t>() < p.addr + p.allocated) {
-      return true;
-    }
+  remote_ptr<uint8_t> pp = ip.to_data_ptr<uint8_t>();
+  auto it = syscallbuf_stubs.upper_bound(pp);
+  if (it == syscallbuf_stubs.begin()) {
+    return false;
   }
-  return false;
+  --it;
+  return it->first <= pp && pp < it->first + it->second;
 }
 
 /**
@@ -264,13 +260,23 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
 
   remote_ptr<uint8_t> extended_jump_start =
       allocate_extended_jump<ExtendedJumpPatch>(
-          t, patcher.extended_jump_pages, jump_patch_end,
-          jump_patch_start.as_int() + syscall_instruction_length(x86_64) +
-              hook.next_instruction_length,
-          hook.hook_address);
+          t, patcher.extended_jump_pages, jump_patch_end);
   if (extended_jump_start.is_null()) {
     return false;
   }
+
+  uint8_t stub_patch[ExtendedJumpPatch::size];
+  auto return_addr =
+    jump_patch_start.as_int() + syscall_instruction_length(x86_64) +
+    hook.next_instruction_length;
+  substitute_extended_jump<ExtendedJumpPatch>(stub_patch,
+                                              extended_jump_start.as_int(),
+                                              return_addr,
+                                              hook.hook_address);
+  write_and_record_bytes(t, extended_jump_start, stub_patch);
+
+  patcher.syscallbuf_stubs[extended_jump_start] = ExtendedJumpPatch::size;
+
   intptr_t jump_offset = extended_jump_start - jump_patch_end;
   int32_t jump_offset32 = (int32_t)jump_offset;
   ASSERT(t, jump_offset32 == jump_offset)
@@ -283,11 +289,12 @@ static bool patch_syscall_with_hook_x86ish(Monkeypatcher& patcher,
   static const uint8_t NOP = 0x90;
   DEBUG_ASSERT(syscall_instruction_length(x86_64) ==
                syscall_instruction_length(x86));
-  uint8_t nops[syscall_instruction_length(x86_64) +
-               hook.next_instruction_length - sizeof(jump_patch)];
-  memset(nops, NOP, sizeof(nops));
-  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops,
-                       sizeof(nops));
+  size_t nops_bufsize = syscall_instruction_length(x86_64) +
+                        hook.next_instruction_length - sizeof(jump_patch);
+  std::unique_ptr<uint8_t[]> nops(new uint8_t[nops_bufsize]);
+  memset(nops.get(), NOP, nops_bufsize);
+  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops.get(),
+                       nops_bufsize);
 
   return true;
 }
@@ -403,14 +410,11 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
   uint8_t following_bytes[256];
   size_t bytes_count = t->read_bytes_fallible(
       ip.to_data_ptr<uint8_t>(), sizeof(following_bytes), following_bytes);
-  if (bytes_count < sizeof(syscall_patch_hook::next_instruction_bytes)) {
-    tried_to_patch_syscall_addresses.insert(ip);
-    return false;
-  }
 
   intptr_t syscallno = r.original_syscallno();
   for (auto& hook : syscall_hooks) {
-    if (memcmp(following_bytes, hook.next_instruction_bytes,
+    if (bytes_count >= hook.next_instruction_length &&
+        memcmp(following_bytes, hook.next_instruction_bytes,
                hook.next_instruction_length) == 0) {
       // Search for a following short-jump instruction that targets an
       // instruction
@@ -455,10 +459,14 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
                    << " bytes "
                    << bytes_to_string(
                           following_bytes,
-                          sizeof(syscall_patch_hook::next_instruction_bytes));
+                          min(bytes_count,
+                              sizeof(
+                                  syscall_patch_hook::next_instruction_bytes)));
 
         // Get out of executing the current syscall before we patch it.
-        t->exit_syscall_and_prepare_restart();
+        if (!t->exit_syscall_and_prepare_restart()) {
+          return false;
+        }
 
         patch_syscall_with_hook(*this, t, hook);
 
@@ -472,20 +480,22 @@ bool Monkeypatcher::try_patch_syscall(RecordTask* t) {
              << " bytes "
              << bytes_to_string(
                     following_bytes,
-                    sizeof(syscall_patch_hook::next_instruction_bytes));
+                    min(bytes_count,
+                        sizeof(syscall_patch_hook::next_instruction_bytes)));
   tried_to_patch_syscall_addresses.insert(ip);
   return false;
 }
 
 class VdsoReader : public ElfReader {
 public:
-  VdsoReader(RecordTask* t) : ElfReader(t->arch()), t(t) {}
-  virtual bool read(size_t offset, size_t size, void* buf) override {
-    bool ok = true;
-    t->read_bytes_helper(t->vm()->vdso().start() + offset, size, buf, &ok);
-    return ok;
+  VdsoReader(RecordTask* t) : ElfReader(t->arch()) {
+    size = t->vm()->vdso().size();
+    map = new uint8_t[size];
+    t->read_bytes_helper(t->vm()->vdso().start(), size, map);
   }
-  RecordTask* t;
+  virtual ~VdsoReader() {
+    delete[] map;
+  }
 };
 
 /**
@@ -498,6 +508,9 @@ static bool is_kernel_vsyscall(RecordTask* t, remote_ptr<void> addr) {
   return X86SysenterVsyscallImplementation::match(impl) ||
          X86SysenterVsyscallImplementationAMD::match(impl);
 }
+
+static const uintptr_t MAX_VDSO_SIZE = 16384;
+static const uintptr_t VDSO_ABSOLUTE_ADDRESS = 0xffffe000;
 
 /**
  * Return the address of a recognized |__kernel_vsyscall()|
@@ -521,10 +534,10 @@ static remote_ptr<void> locate_and_verify_kernel_vsyscall(
         continue;
       }
       // The symbol values can be absolute or relative addresses.
-      // The first part of the assertion is for absolute
-      // addresses, and the second part is for relative.
-      if ((file_offset & ~uintptr_t(0xfff)) != 0xffffe000 &&
-          (file_offset & ~uintptr_t(0xfff)) != 0) {
+      if (file_offset >= VDSO_ABSOLUTE_ADDRESS) {
+        file_offset -= VDSO_ABSOLUTE_ADDRESS;
+      }
+      if (file_offset > MAX_VDSO_SIZE) {
         // With 4.2.8-300.fc23.x86_64, execve_loop_32 seems to once in a while
         // see a VDSO with a crazy file offset in it which is a duplicate
         // __kernel_vsyscall. Bizzarro. Ignore it.
@@ -537,8 +550,7 @@ static remote_ptr<void> locate_and_verify_kernel_vsyscall(
       // however, subjects the VDSO to ASLR, which means that
       // we have to adjust the offsets properly.
       auto vdso_start = t->vm()->vdso().start();
-      uintptr_t candidate_offset = file_offset & uintptr_t(0xfff);
-      remote_ptr<void> candidate = vdso_start + candidate_offset;
+      remote_ptr<void> candidate = vdso_start + file_offset;
 
       if (is_kernel_vsyscall(t, candidate)) {
         kernel_vsyscall = candidate;
@@ -563,6 +575,24 @@ struct named_syscall {
   const char* name;
   int syscall_number;
 };
+
+static void erase_section(RecordTask* t, VdsoReader& reader, const char* name) {
+  SectionOffsets offsets = reader.find_section_file_offsets(name);
+  if (offsets.end > offsets.start) {
+    vector<uint8_t> zeroes;
+    zeroes.resize(offsets.end - offsets.start);
+    memset(zeroes.data(), 0, zeroes.size());
+    write_and_record_bytes(t,
+        t->vm()->vdso().start() + offsets.start,
+        offsets.end - offsets.start, zeroes.data());
+  }
+}
+
+static void obliterate_debug_info(RecordTask* t, VdsoReader& reader) {
+  erase_section(t, reader, ".eh_frame");
+  erase_section(t, reader, ".eh_frame_hdr");
+  erase_section(t, reader, ".note");
+}
 
 // Monkeypatch x86-32 vdso syscalls immediately after exec. The vdso syscalls
 // will cause replay to fail if called by the dynamic loader or some library's
@@ -599,8 +629,7 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
   auto vdso_start = t->vm()->vdso().start();
 
   static const named_syscall syscalls_to_monkeypatch[] = {
-#define S(n)                                                                   \
-  { "__vdso_" #n, X86Arch::n }
+#define S(n) { "__vdso_" #n, X86Arch::n }
     S(clock_gettime), S(gettimeofday), S(time),
 #undef S
   };
@@ -612,8 +641,7 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
         if (!reader.addr_to_offset(syms.addr(i), file_offset)) {
           continue;
         }
-        static const uintptr_t vdso_max_size = 0xffffLL;
-        if ((file_offset & ~vdso_max_size) != 0) {
+        if (file_offset > MAX_VDSO_SIZE) {
           // With 4.3.3-301.fc23.x86_64, once in a while we
           // see a VDSO symbol with a crazy file offset in it which is a
           // duplicate of another symbol. Bizzarro. Ignore it.
@@ -637,6 +665,7 @@ void patch_after_exec_arch<X86Arch>(RecordTask* t, Monkeypatcher& patcher) {
       }
     }
   }
+  obliterate_debug_info(t, reader);
 }
 
 // Monkeypatch x86 vsyscall hook only after the preload library
@@ -667,8 +696,9 @@ void patch_at_preload_init_arch<X86Arch>(RecordTask* t,
     // We're patching in a relative jump, so we need to compute the offset from
     // the end of the jump to our actual destination.
     X86SysenterVsyscallSyscallHook::substitute(
-        patch, syscallhook_vsyscall_entry.as_int() -
-                   (kernel_vsyscall + sizeof(patch)).as_int());
+        patch,
+        syscallhook_vsyscall_entry.as_int() -
+            (kernel_vsyscall + sizeof(patch)).as_int());
     write_and_record_bytes(t, kernel_vsyscall, patch);
     LOG(debug) << "monkeypatched __kernel_vsyscall to jump to "
                << HEX(syscallhook_vsyscall_entry.as_int());
@@ -701,13 +731,8 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
   auto syms = reader.read_symbols(".dynsym", ".dynstr");
 
   static const named_syscall syscalls_to_monkeypatch[] = {
-#define S(n)                                                                   \
-  { "__vdso_" #n, X64Arch::n }
-    S(clock_gettime), S(gettimeofday), S(time),
-    // getcpu isn't supported by rr, so any changes to this monkeypatching
-    // scheme for efficiency's sake will have to ensure that getcpu gets
-    // converted to an actual syscall so rr will complain appropriately.
-    S(getcpu),
+#define S(n) { "__vdso_" #n, X64Arch::n }
+    S(clock_gettime), S(gettimeofday), S(time), S(getcpu),
 #undef S
   };
 
@@ -720,16 +745,17 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
                      << " to offset";
           continue;
         }
+        uint64_t file_offset_64 = file_offset;
         // Absolutely-addressed symbols in the VDSO claim to start here.
         static const uint64_t vdso_static_base = 0xffffffffff700000LL;
-        static const uintptr_t vdso_max_size = 0xffffLL;
-        uint64_t sym_offset = file_offset & vdso_max_size;
+        static const uint64_t vdso_max_size = 0xffffLL;
+        uint64_t sym_offset = file_offset_64 & vdso_max_size;
 
         // In 4.4.6-301.fc23.x86_64 we occasionally see a grossly invalid
         // address, se.g. 0x11c6970 for __vdso_getcpu. :-(
-        if ((file_offset >= vdso_static_base &&
-             file_offset < vdso_static_base + vdso_size) ||
-            file_offset < vdso_size) {
+        if ((file_offset_64 >= vdso_static_base &&
+             file_offset_64 < vdso_static_base + vdso_size) ||
+            file_offset_64 < vdso_size) {
           uintptr_t absolute_address = vdso_start.as_int() + sym_offset;
 
           uint8_t patch[X64VsyscallMonkeypatch::size];
@@ -758,6 +784,15 @@ void patch_after_exec_arch<X64Arch>(RecordTask* t, Monkeypatcher& patcher) {
         }
       }
     }
+  }
+
+  obliterate_debug_info(t, reader);
+
+  for (const auto& m : t->vm()->maps()) {
+    auto& km = m.map;
+    patcher.patch_after_mmap(t, km.start(), km.size(),
+                             km.file_offset_bytes()/page_size(), -1,
+                             Monkeypatcher::MMAP_EXEC);
   }
 }
 
@@ -788,22 +823,33 @@ void Monkeypatcher::patch_at_preload_init(RecordTask* t) {
   RR_ARCH_FUNCTION(patch_at_preload_init_arch, t->arch(), t, *this);
 }
 
-static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
-                                 uintptr_t elf_addr, const void* bytes,
-                                 size_t size, remote_ptr<void> map_start,
-                                 size_t map_size, size_t map_offset_pages) {
+static remote_ptr<void> resolve_address(ElfReader& reader, uintptr_t elf_addr,
+                                        remote_ptr<void> map_start,
+                                        size_t map_size,
+                                        size_t map_offset_pages) {
   uintptr_t file_offset;
   if (!reader.addr_to_offset(elf_addr, file_offset)) {
     LOG(warn) << "ELF address " << HEX(elf_addr) << " not in file";
   }
   uintptr_t map_offset = uintptr_t(map_offset_pages) * page_size();
-  if (file_offset < map_offset || file_offset + size > map_offset + map_size) {
+  if (file_offset < map_offset || file_offset + 32 > map_offset + map_size) {
     // The value(s) to be set are outside the mapped range. This happens
     // because code and data can be mapped in separate, partial mmaps in which
     // case some symbols will be outside the mapped range.
+    return nullptr;
+  }
+  return map_start + uintptr_t(file_offset - map_offset);
+}
+
+static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
+                                 uintptr_t elf_addr, const void* bytes,
+                                 size_t size, remote_ptr<void> map_start,
+                                 size_t map_size, size_t map_offset_pages) {
+  remote_ptr<void> addr =
+    resolve_address(reader, elf_addr, map_start, map_size, map_offset_pages);
+  if (!addr) {
     return;
   }
-  remote_ptr<void> addr = map_start + uintptr_t(file_offset - map_offset);
   bool ok = true;
   t->write_bytes_helper(addr, size, bytes, &ok);
   // Writing can fail when the value appears to be in the mapped range, but it
@@ -813,14 +859,111 @@ static void set_and_record_bytes(RecordTask* t, ElfReader& reader,
   }
 }
 
+/**
+ * Patch _dl_runtime_resolve_(fxsave,xsave,xsavec) to clear "FDP Data Pointer"
+ * register so that CPU-specific behaviors involving that register don't leak
+ * into stack memory.
+ */
+static void patch_dl_runtime_resolve(Monkeypatcher& patcher,
+                                     RecordTask* t, ElfReader& reader,
+                                     uintptr_t elf_addr,
+                                     remote_ptr<void> map_start,
+                                     size_t map_size,
+                                     size_t map_offset_pages) {
+  if (t->arch() != x86_64) {
+    return;
+  }
+  remote_ptr<void> addr =
+    resolve_address(reader, elf_addr, map_start, map_size, map_offset_pages);
+  if (!addr) {
+    return;
+  }
+
+  uint8_t impl[X64DLRuntimeResolve::size];
+  t->read_bytes(addr, impl);
+  if (!X64DLRuntimeResolve::match(impl) &&
+      !X64DLRuntimeResolve2::match(impl)) {
+    LOG(warn) << "_dl_runtime_resolve implementation doesn't look right";
+    return;
+  }
+
+  uint8_t jump_patch[X64JumpMonkeypatch::size];
+  // We're patching in a relative jump, so we need to compute the offset from
+  // the end of the jump to our actual destination.
+  auto jump_patch_start = addr.cast<uint8_t>();
+  auto jump_patch_end = jump_patch_start + sizeof(jump_patch);
+
+  remote_ptr<uint8_t> extended_jump_start =
+      allocate_extended_jump<X64DLRuntimeResolvePrelude>(
+          t, patcher.extended_jump_pages, jump_patch_end);
+  if (extended_jump_start.is_null()) {
+    return;
+  }
+  uint8_t stub_patch[X64DLRuntimeResolvePrelude::size];
+  int64_t return_offset = jump_patch_start.as_int() +
+    X64DLRuntimeResolve::size -
+    (extended_jump_start.as_int() + X64DLRuntimeResolvePrelude::size);
+  if (return_offset != (int32_t)return_offset) {
+    LOG(warn) << "Return out of range";
+    return;
+  }
+  X64DLRuntimeResolvePrelude::substitute(stub_patch, (int32_t)return_offset);
+  write_and_record_bytes(t, extended_jump_start, stub_patch);
+
+  intptr_t jump_offset = extended_jump_start - jump_patch_end;
+  int32_t jump_offset32 = (int32_t)jump_offset;
+  ASSERT(t, jump_offset32 == jump_offset)
+      << "allocate_extended_jump didn't work";
+  X64JumpMonkeypatch::substitute(jump_patch, jump_offset32);
+  write_and_record_bytes(t, jump_patch_start, jump_patch);
+
+  // pad with NOPs to the next instruction
+  static const uint8_t NOP = 0x90;
+  uint8_t nops[X64DLRuntimeResolve::size - sizeof(jump_patch)];
+  memset(nops, NOP, sizeof(nops));
+  write_and_record_mem(t, jump_patch_start + sizeof(jump_patch), nops,
+                       sizeof(nops));
+}
+
+static bool file_may_need_instrumentation(const AddressSpace::Mapping& map) {
+  size_t file_part = map.map.fsname().rfind('/');
+  if (file_part == string::npos) {
+    file_part = 0;
+  } else {
+    ++file_part;
+  }
+  const string& fsname = map.map.fsname();
+  return fsname.find("libpthread", file_part) != string::npos ||
+    fsname.find("ld", file_part) != string::npos;
+}
+
 void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
                                      size_t size, size_t offset_pages,
-                                     int child_fd) {
+                                     int child_fd, MmapMode mode) {
   const auto& map = t->vm()->mapping_of(start);
-  if (map.map.fsname().find("libpthread") != string::npos &&
+  if (file_may_need_instrumentation(map) &&
       (t->arch() == x86 || t->arch() == x86_64)) {
-    ScopedFd open_fd = t->open_fd(child_fd, O_RDONLY);
-    ASSERT(t, open_fd.is_open()) << "Failed to open child fd " << child_fd;
+    ScopedFd open_fd;
+    if (child_fd >= 0) {
+      open_fd = t->open_fd(child_fd, O_RDONLY);
+      ASSERT(t, open_fd.is_open()) << "Failed to open child fd " << child_fd;
+    } else {
+      char buf[100];
+      sprintf(buf, "/proc/%d/map_files/%llx-%llx", t->tid,
+              (long long)start.as_int(), (long long)start.as_int() + size);
+      // Reading these directly requires CAP_SYS_ADMIN, so open the link target
+      // instead.
+      char link[PATH_MAX];
+      int ret = readlink(buf, link, sizeof(link) - 1);
+      if (ret < 0) {
+        return;
+      }
+      link[ret] = 0;
+      open_fd = ScopedFd(link, O_RDONLY);
+      if (!open_fd.is_open()) {
+        return;
+      }
+    }
     ElfFileReader reader(open_fd, t->arch());
     // Check for symbols first in the library itself, regardless of whether
     // there is a debuglink.  For example, on Fedora 26, the .symtab and
@@ -851,6 +994,18 @@ void Monkeypatcher::patch_after_mmap(RecordTask* t, remote_ptr<void> start,
         static const uint8_t ret = 0xC3;
         set_and_record_bytes(t, reader, syms.addr(i), &ret, sizeof(ret), start,
                              size, offset_pages);
+      }
+      // The following operations can only be applied once because after the
+      // patch is applied the code no longer matches the expected template.
+      // For replaying a replay to work, we need to only apply these changes
+      // during a real exec, not during the mmap operations performed when rr
+      // replays an exec.
+      if (mode == MMAP_EXEC &&
+          (syms.is_name(i, "_dl_runtime_resolve_fxsave") ||
+           syms.is_name(i, "_dl_runtime_resolve_xsave") ||
+           syms.is_name(i, "_dl_runtime_resolve_xsavec"))) {
+        patch_dl_runtime_resolve(*this, t, reader, syms.addr(i), start, size,
+                                 offset_pages);
       }
     }
   }

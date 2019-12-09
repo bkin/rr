@@ -22,6 +22,7 @@
 #include "RecordSession.h"
 #include "RecordTask.h"
 #include "TraceStream.h"
+#include "VirtualPerfCounterMonitor.h"
 #include "core.h"
 #include "kernel_metadata.h"
 #include "log.h"
@@ -80,27 +81,23 @@ static void restore_signal_state(RecordTask* t, int sig,
   }
 }
 
-static const uintptr_t CPUID_RDRAND_FLAG = 1 << 30;
-static const uintptr_t CPUID_RTM_FLAG = 1 << 11;
-static const uintptr_t CPUID_RDSEED_FLAG = 1 << 18;
-
 /**
  * Return true if |t| was stopped because of a SIGSEGV resulting
  * from a disabled instruction and |t| was updated appropriately, false
  * otherwise.
  */
-static bool try_handle_disabled_insn(RecordTask* t, siginfo_t* si) {
+static bool try_handle_trapped_instruction(RecordTask* t, siginfo_t* si) {
   ASSERT(t, si->si_signo == SIGSEGV);
 
-  auto disabled_insn = disabled_insn_at(t, t->ip());
-  switch (disabled_insn) {
-    case DisabledInsn::RDTSC:
-    case DisabledInsn::RDTSCP:
+  auto trapped_instruction = trapped_instruction_at(t, t->ip());
+  switch (trapped_instruction) {
+    case TrappedInstruction::RDTSC:
+    case TrappedInstruction::RDTSCP:
       if (t->tsc_mode == PR_TSC_SIGSEGV) {
         return false;
       }
       break;
-    case DisabledInsn::CPUID:
+    case TrappedInstruction::CPUID:
       if (t->cpuid_mode == 0) {
         return false;
       }
@@ -109,32 +106,22 @@ static bool try_handle_disabled_insn(RecordTask* t, siginfo_t* si) {
       return false;
   }
 
-  size_t len = disabled_insn_len(disabled_insn);
+  size_t len = trapped_instruction_len(trapped_instruction);
   ASSERT(t, len > 0);
 
   Registers r = t->regs();
-  if (disabled_insn == DisabledInsn::RDTSC ||
-      disabled_insn == DisabledInsn::RDTSCP) {
+  if (trapped_instruction == TrappedInstruction::RDTSC ||
+      trapped_instruction == TrappedInstruction::RDTSCP) {
     unsigned long long current_time = rdtsc();
     r.set_rdtsc_output(current_time);
 
     LOG(debug) << " trapped for rdtsc: returning " << current_time;
-  } else if (disabled_insn == DisabledInsn::CPUID) {
+  } else if (trapped_instruction == TrappedInstruction::CPUID) {
     auto eax = r.syscallno();
     auto ecx = r.cx();
     auto cpuid_data = cpuid(eax, ecx);
-    switch (eax) {
-      case CPUID_GETFEATURES:
-        cpuid_data.ecx &= ~CPUID_RDRAND_FLAG;
-        break;
-      case CPUID_GETEXTENDEDFEATURES:
-        if (ecx == 0) {
-          cpuid_data.ebx &= ~(CPUID_RDSEED_FLAG | CPUID_RTM_FLAG);
-        }
-        break;
-      default:
-        break;
-    }
+    t->session().disable_cpuid_features()
+        .amend_cpuid_data(eax, ecx, &cpuid_data);
     r.set_cpuid_output(cpuid_data.eax, cpuid_data.ebx, cpuid_data.ecx,
                        cpuid_data.edx);
     LOG(debug) << " trapped for cpuid: " << HEX(eax) << ":" << HEX(ecx);
@@ -218,7 +205,7 @@ static bool try_grow_map(RecordTask* t, siginfo_t* si) {
       t->vm()->map(t, new_start, it->map.start() - new_start, it->map.prot(),
                    it->map.flags() | MAP_ANONYMOUS, 0, string(),
                    KernelMapping::NO_DEVICE, KernelMapping::NO_INODE);
-  t->trace_writer().write_mapped_region(t, km, km.fake_stat());
+  t->trace_writer().write_mapped_region(t, km, km.fake_stat(), vector<TraceRemoteFd>());
   // No need to flush syscallbuf here. It's safe to map these pages "early"
   // before they're really needed.
   t->record_event(Event::grow_map(), RecordTask::DONT_FLUSH_SYSCALLBUF);
@@ -266,9 +253,7 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
                   "enable signal dispatch";
     // This is a single instruction that jumps to the location stored in
     // preload_thread_locals::stub_scratch_1. Emulate it.
-    Registers r = t->regs();
-    r.set_ip(get_stub_scratch_1(t));
-    t->set_regs(r);
+    t->emulate_jump(get_stub_scratch_1(t));
 
     restore_sighandler_if_not_default(t, SIGTRAP);
     // Now we're back in application code so any pending stashed signals
@@ -335,8 +320,11 @@ bool handle_syscallbuf_breakpoint(RecordTask* t) {
  * to the tracee's latest state.
  */
 static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
-  ASSERT(t, SYSCALLBUF_DESCHED_SIGNAL == si->si_signo && si->si_code == POLL_IN)
-      << "Tracee is using SIGPWR??? (siginfo=" << *si << ")";
+  ASSERT(t, t->session().syscallbuf_desched_sig() == si->si_signo && si->si_code == POLL_IN)
+      << "Tracee is using the syscallbuf signal ("
+      << signal_name(t->session().syscallbuf_desched_sig())
+      << ") ??? (siginfo=" << *si << ")\n"
+      << "Try recording with --syscall-buffer-sig=<UNUSED SIGNAL>";
 
   /* If the tracee isn't in the critical section where a desched
    * event is relevant, we can ignore it.  See the long comments
@@ -441,8 +429,9 @@ static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
       break;
     }
     if (t->ptrace_event() == PTRACE_EVENT_SECCOMP) {
-      ASSERT(t, t->session().syscall_seccomp_ordering() ==
-                    Session::SECCOMP_BEFORE_PTRACE_SYSCALL);
+      ASSERT(t,
+             t->session().syscall_seccomp_ordering() ==
+                 Session::SECCOMP_BEFORE_PTRACE_SYSCALL);
       // This is the old kernel event ordering. This must be a SECCOMP event
       // for the buffered syscall; it's not rr-generated because this is an
       // untraced syscall, but it could be generated by a tracee's
@@ -472,7 +461,7 @@ static void handle_desched_event(RecordTask* t, const siginfo_t* si) {
       LOG(debug) << " disabling breakpoints on untraced syscalls";
       continue;
     }
-    if (SYSCALLBUF_DESCHED_SIGNAL == sig ||
+    if (t->session().syscallbuf_desched_sig() == sig ||
         PerfCounters::TIME_SLICE_SIGNAL == sig || t->is_sig_ignored(sig)) {
       LOG(debug) << "  dropping ignored " << signal_name(sig);
       continue;
@@ -555,7 +544,17 @@ static bool is_safe_to_deliver_signal(RecordTask* t, siginfo_t* si) {
                << " because in traced syscall";
     return true;
   }
-  if (t->is_at_traced_syscall_entry()) {
+
+  // Don't deliver signals just before entering rrcall_notify_syscall_hook_exit.
+  // At that point, notify_on_syscall_hook_exit will be set, but we have
+  // passed the point at which syscallbuf code has checked that flag.
+  // Replay will set notify_on_syscall_hook_exit when we replay towards the
+  // rrcall_notify_syscall_hook_exit *after* handling this signal, but
+  // that will be too late for syscallbuf to notice.
+  // It's OK to delay signal delivery until after rrcall_notify_syscall_hook_exit
+  // anyway.
+  if (t->is_at_traced_syscall_entry() &&
+      !is_rrcall_notify_syscall_hook_exit_syscall(t->regs().syscallno(), t->arch())) {
     LOG(debug) << "Safe to deliver signal at " << t->ip()
                << " because at entry to traced syscall";
     return true;
@@ -623,7 +622,7 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // signal was generated for rr's purposes, we need to restore the signal
     // state ourselves.
     if (sig == SIGSEGV &&
-        (try_handle_disabled_insn(t, si) || try_grow_map(t, si))) {
+        (try_handle_trapped_instruction(t, si) || try_grow_map(t, si))) {
       if (signal_was_blocked || t->is_sig_ignored(sig)) {
         restore_signal_state(t, sig, signal_was_blocked);
       }
@@ -637,26 +636,31 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     }
   }
 
-  /* We have to check for a desched event first, because for
-   * those we *do not* want to (and cannot, most of the time)
-   * step the tracee out of the syscallbuf code before
-   * attempting to deliver the signal. */
-  if (SYSCALLBUF_DESCHED_SIGNAL == si->si_signo) {
-    handle_desched_event(t, si);
-    return SIGNAL_HANDLED;
-  }
+  if (!VirtualPerfCounterMonitor::is_virtual_perf_counter_signal(si)) {
+    /* We have to check for a desched event first, because for
+     * those we *do not* want to (and cannot, most of the time)
+     * step the tracee out of the syscallbuf code before
+     * attempting to deliver the signal. */
+    if (t->session().syscallbuf_desched_sig() == si->si_signo) {
+      handle_desched_event(t, si);
+      return SIGNAL_HANDLED;
+    }
 
-  if (!is_safe_to_deliver_signal(t, si)) {
-    return DEFER_SIGNAL;
-  }
+    if (!is_safe_to_deliver_signal(t, si)) {
+      return DEFER_SIGNAL;
+    }
 
-  if (!t->set_siginfo_for_synthetic_SIGCHLD(si)) {
-    return DEFER_SIGNAL;
-  }
+    if (!t->set_siginfo_for_synthetic_SIGCHLD(si)) {
+      return DEFER_SIGNAL;
+    }
 
-  if (sig == PerfCounters::TIME_SLICE_SIGNAL) {
-    t->push_event(Event::sched());
-    return SIGNAL_HANDLED;
+    if (sig == PerfCounters::TIME_SLICE_SIGNAL) {
+      t->push_event(Event::sched());
+      return SIGNAL_HANDLED;
+    }
+  } else {
+    // Clear the magic flag so it doesn't leak into the program.
+    si->si_errno = 0;
   }
 
   /* This signal was generated by the program or an external
@@ -671,15 +675,11 @@ SignalHandled handle_signal(RecordTask* t, siginfo_t* si,
     // currently assumes it won't encounter a deterministic SIGTRAP (due to
     // a hardcoded breakpoint in the tracee).
     if (deterministic == DETERMINISTIC_SIG) {
-      t->push_event(Event(EV_SIGNAL, SignalEvent(*si, deterministic,
-                                                 t->sig_resolved_disposition(
-                                                     sig, deterministic))));
-      t->record_current_event();
-      t->pop_event(EV_SIGNAL);
+      t->record_event(Event(EV_SIGNAL, SignalEvent(*si, deterministic,
+                                                   t->sig_resolved_disposition(
+                                                       sig, deterministic))));
     } else {
-      t->push_event(Event::sched());
-      t->record_current_event();
-      t->pop_event(EV_SCHED);
+      t->record_event(Event::sched());
     }
     // ptracer has been notified, so don't deliver the signal now.
     // The signal won't be delivered for real until the ptracer calls

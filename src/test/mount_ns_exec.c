@@ -6,12 +6,12 @@
 int main(int argc, char* argv[]) {
   if ((argc > 1 && strcmp(argv[1], "in_copy") == 0) ||
       -1 == try_setup_ns(CLONE_NEWNS)) {
-    atomic_printf("EXIT-SUCCESS");
+    atomic_puts("EXIT-SUCCESS");
     return 0;
   }
 
   test_assert(0 == mkdir("mountpoint", 0700));
-  test_assert(0 == mount("", "mountpoint", "tmpfs", 0, NULL));
+  test_assert(0 == mount("none", "mountpoint", "tmpfs", 0, NULL));
 
   struct stat buf;
   stat("/proc/self/exe", &buf);

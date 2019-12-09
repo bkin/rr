@@ -8,6 +8,7 @@
 #include <linux/seccomp.h>
 #include <linux/usbdevice_fs.h>
 #include <signal.h>
+#include <stdint.h>
 #include <sys/ioctl.h>
 #include <sys/ptrace.h>
 
@@ -79,6 +80,13 @@ namespace rr {
 
 #ifndef SYS_SECCOMP
 #define SYS_SECCOMP 1
+#endif
+
+#ifndef PR_GET_SPECULATION_CTRL
+#define PR_GET_SPECULATION_CTRL 52
+#endif
+#ifndef PR_SET_SPECULATION_CTRL
+#define PR_SET_SPECULATION_CTRL 53
 #endif
 
 // These are defined by the include/linux/errno.h in the kernel tree.
@@ -163,6 +171,19 @@ struct usbdevfs_streams {
 #endif
 #ifndef TIOCGEXCL
 #define TIOCGEXCL _IOR('T', 0x40, int)
+#endif
+#ifndef TIOCGPTPEER
+#define TIOCGPTPEER _IO('T', 0x41)
+#endif
+
+struct rr_input_mask {
+  uint32_t type;
+  uint32_t codes_size;
+  uint64_t codes_ptr;
+};
+
+#ifndef EVIOCGMASK
+#define EVIOCGMASK _IOR('E', 0x92, struct rr_input_mask)
 #endif
 
 #ifndef MADV_FREE
@@ -292,6 +313,20 @@ struct usbdevfs_streams {
 #ifndef ARCH_SET_CPUID
 #define ARCH_SET_CPUID 0x1012
 #endif
+
+// New in the 4.15 kernel
+#ifndef MAP_SYNC
+#define MAP_SYNC  0x80000
+#endif
+
+enum {
+  BPF_MAP_CREATE,
+  BPF_MAP_LOOKUP_ELEM,
+  BPF_MAP_UPDATE_ELEM,
+  BPF_MAP_DELETE_ELEM,
+  BPF_MAP_GET_NEXT_KEY,
+  BPF_PROG_LOAD,
+};
 
 } // namespace rr
 

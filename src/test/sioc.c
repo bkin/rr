@@ -104,6 +104,12 @@ static void generic_request_by_name(int sockfd, struct ifreq* req, int nr,
   ret = ioctl(sockfd, nr, req);
   VERIFY_GUARD(req);
   atomic_printf("%s(ret:%d): %s ", nr_str, ret, req->ifr_name);
+  if (ret < 0 && errno == EFAULT && nr == SIOCGIFADDR) {
+    /* Work around https://bugzilla.kernel.org/show_bug.cgi?id=202273 */
+    atomic_puts("Buggy kernel detected; aborting test");
+    atomic_puts("EXIT-SUCCESS");
+    exit(0);
+  }
   test_assert(0 == ret);
 }
 
@@ -127,7 +133,8 @@ static int generic_wireless_request_by_name_internal(int sockfd,
   atomic_printf("%s(ret:%d): %s: ", nr_str, ret, (*wreq)->ifr_name);
   if (-1 == ret) {
     atomic_printf("WARNING: %s doesn't support ioctl %s\n", name, nr_str);
-    test_assert(EOPNOTSUPP == err || EPERM == err || EINVAL == err);
+    /* "bond" network devices can return ENODEV. */
+    test_assert(EOPNOTSUPP == err || EPERM == err || EINVAL == err || ENODEV == err);
   }
   return ret;
 }
@@ -171,6 +178,12 @@ int main(void) {
   VERIFY_GUARD(req);
   atomic_printf("SIOCGIFINDEX(ret:%d): %s index is %d\n", ret, req->ifr_name,
                 req->ifr_ifindex);
+  if (ret < 0 && errno == EFAULT) {
+    /* Work around https://bugzilla.kernel.org/show_bug.cgi?id=199469 */
+    atomic_puts("Buggy kernel detected; aborting test");
+    atomic_puts("EXIT-SUCCESS");
+    return 0;
+  }
   test_assert(0 == ret);
   test_assert(req->ifr_ifindex != -1);
   index = req->ifr_ifindex;
@@ -182,7 +195,6 @@ int main(void) {
   atomic_printf("SIOCGIFNAME(ret:%d): index %d(%s) name is %s\n", ret, index,
                 name, req->ifr_name);
   test_assert(0 == ret);
-  test_assert(!strcmp(name, req->ifr_name));
 
   GENERIC_REQUEST_BY_NAME(SIOCGIFFLAGS);
   atomic_printf("flags are %#x\n", req->ifr_flags);
@@ -198,9 +210,22 @@ int main(void) {
 
   GENERIC_REQUEST_BY_NAME(SIOCGIFNETMASK);
   atomic_printf("netmask is %s\n", sockaddr_name(&req->ifr_addr));
+  if (ret < 0 && errno == EFAULT) {
+    /* Work around https://bugzilla.kernel.org/show_bug.cgi?id=202273 */
+    atomic_puts("Buggy kernel detected; aborting test");
+    atomic_puts("EXIT-SUCCESS");
+    return 0;
+  }
 
   GENERIC_REQUEST_BY_NAME(SIOCGIFMETRIC);
   atomic_printf("metric is %d\n", req->ifr_metric);
+
+  GENERIC_REQUEST_BY_NAME(SIOCGIFMAP);
+  atomic_printf("map is %llu,%llu,%u,%d,%d,%d\n",
+                (unsigned long long)req->ifr_map.mem_start,
+                (unsigned long long)req->ifr_map.mem_end,
+                req->ifr_map.base_addr, req->ifr_map.irq, req->ifr_map.dma,
+                req->ifr_map.port);
 
   memset(&req->ifr_metric, 0xff, sizeof(req->ifr_metric));
   ret = ioctl(sockfd, SIOCGIFMEM, req);
@@ -267,7 +292,8 @@ int main(void) {
   atomic_printf("SIOCGIWESSID(ret:%d): %s: ", ret, wreq->ifr_name);
   if (-1 == ret) {
     atomic_printf("WARNING: %s doesn't appear to be a wireless iface\n", name);
-    test_assert(EOPNOTSUPP == err || EPERM == err || EINVAL == err);
+    /* "bond" network devices can return ENODEV. */
+    test_assert(EOPNOTSUPP == err || EPERM == err || EINVAL == err || ENODEV == err);
   } else {
     atomic_printf("wireless ESSID:%s\n", buf);
   }

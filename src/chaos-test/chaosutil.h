@@ -8,6 +8,7 @@
 
 #include <errno.h>
 #include <pthread.h>
+#include <sched.h>
 #include <stdarg.h>
 #include <stdint.h>
 #include <stdio.h>
@@ -79,5 +80,7 @@ inline static double now_double(void) {
   clock_gettime(CLOCK_MONOTONIC, &ts);
   return ts.tv_sec + ts.tv_nsec / 1000000000.0;
 }
+
+inline static long get_page_size(void) { return sysconf(_SC_PAGE_SIZE); }
 
 #endif

@@ -16,14 +16,6 @@
 #include "preload_interface.h"
 #include "syscallbuf.h"
 
-/* Points at the libc/pthread real_pthread_mutex_timedlock().  We wrap
- * real_pthread_mutex_timedlock(), so need to retain this pointer to call
- * out to the libc version. There is no __pthread_mutex_timedlock stub to call.
- * There are some explicitly-versioned stubs but let's not use those. */
-static int (*real_pthread_mutex_timedlock)(pthread_mutex_t* mutex,
-                                           const struct timespec* abstime);
-
-#define PTHREAD_MUTEX_TYPE_MASK 3
 #define PTHREAD_MUTEX_PRIO_INHERIT_NP 32
 
 static void fix_mutex_kind(pthread_mutex_t* mutex) {
@@ -32,11 +24,12 @@ static void fix_mutex_kind(pthread_mutex_t* mutex) {
 }
 
 /*
- * We bind directly to __pthread_mutex_lock and __pthread_mutex_trylock
- * because setting up indirect function pointers in init_process requires
- * calls to dlsym which itself can call pthread_mutex_lock (e.g. via
- * application code overriding malloc/calloc to use a pthreads-based
- * implementation).
+ * We need to able to call directly to __pthread_mutex_lock and
+ * __pthread_mutex_trylock because setting up indirect function pointers
+ * in init_process requires calls to dlsym which itself can call
+ * pthread_mutex_lock (e.g. via application code overriding malloc/calloc
+ * to use a pthreads-based implementation). So before our pointers are set
+ * up, call these.
  */
 extern int __pthread_mutex_lock(pthread_mutex_t* mutex);
 extern int __pthread_mutex_trylock(pthread_mutex_t* mutex);
@@ -46,6 +39,9 @@ extern int __pthread_mutex_trylock(pthread_mutex_t* mutex);
    are later rolled back if the transaction fails. */
 int pthread_mutex_lock(pthread_mutex_t* mutex) {
   fix_mutex_kind(mutex);
+  if (real_pthread_mutex_lock) {
+    return real_pthread_mutex_lock(mutex);
+  }
   return __pthread_mutex_lock(mutex);
 }
 
@@ -53,16 +49,16 @@ int pthread_mutex_timedlock(pthread_mutex_t* mutex,
                             const struct timespec* abstime) {
   fix_mutex_kind(mutex);
   /* No __pthread_mutex_timedlock stub exists, so we have to use the
-   * indirect call.
+   * indirect call no matter what.
    */
-  if (!real_pthread_mutex_timedlock) {
-    real_pthread_mutex_timedlock = dlsym(RTLD_NEXT, "pthread_mutex_timedlock");
-  }
   return real_pthread_mutex_timedlock(mutex, abstime);
 }
 
 int pthread_mutex_trylock(pthread_mutex_t* mutex) {
   fix_mutex_kind(mutex);
+  if (real_pthread_mutex_trylock) {
+    return real_pthread_mutex_trylock(mutex);
+  }
   return __pthread_mutex_trylock(mutex);
 }
 
@@ -88,6 +84,17 @@ long sysconf(int name) {
       return globals.pretend_num_cores ? globals.pretend_num_cores : 1;
   }
   return __sysconf(name);
+}
+
+typedef void* Dlopen(const char* filename, int flags);
+
+void* dlopen(const char* filename, int flags) {
+  // Give up our timeslice now. This gives us a full timeslice to
+  // execute the dlopen(), reducing the chance we'll hit
+  // https://sourceware.org/bugzilla/show_bug.cgi?id=19329.
+  Dlopen* f_ptr = (Dlopen*)dlsym(RTLD_NEXT, "dlopen");
+  sched_yield();
+  return f_ptr(filename, flags);
 }
 
 /** Disable XShm since rr doesn't work with it */
@@ -130,9 +137,32 @@ void spurious_desched_syscall(struct syscall_info* info) {
 
 /**
  * glibc geteuid() can be compiled to instructions ending in "syscall; ret"
- * which can't be hooked. So override it here with something that can be hooked.
+ * which sometimes can't be hooked. So override it here with something that
+ * can be hooked.
  */
 uid_t geteuid(void) { return syscall(SYS_geteuid); }
+
+/**
+ * clang's LeakSanitizer has regular threads call sched_yield() in a loop while
+ * a helper thread ptrace-attaches to them. If we let sched_yield() enter the
+ * syscallbuf, the helper thread sees that the regular thread SP register
+ * is pointing to the syscallbuf alt-stack, outside the stack region it
+ * expects, which causes it to freak out.
+ * So, override sched_yield() to perform the syscall in a way that can't
+ * be syscall-buffered. (We have no syscall hook for `syscall` followed by
+ * `inc %ecx`).
+ */
+int sched_yield(void) {
+  int trash;
+#ifdef __i386__
+  asm volatile ("int $0x80; inc %0" : "=c"(trash) : "a"(SYS_sched_yield));
+#elif defined(__x86_64__)
+  asm volatile ("syscall; inc %0" : "=c"(trash) : "a"(SYS_sched_yield));
+#else
+#error "Unknown architecture"
+#endif
+  return 0;
+}
 
 typedef void* (*fopen_ptr)(const char* filename, const char* mode);
 

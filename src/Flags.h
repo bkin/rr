@@ -57,9 +57,16 @@ struct Flags {
   // Pretend CPUID faulting support doesn't exist
   bool disable_cpuid_faulting;
 
+  // Don't listen for PTRACE_EVENT_EXIT events, to test how rr handles
+  // missing PTRACE_EVENT_EXITs.
+  bool disable_ptrace_exit_events;
+
   // User override for architecture detection, e.g. when running
   // under valgrind.
   std::string forced_uarch;
+
+  // User override for the path to page files and other resources.
+  std::string resource_path;
 
   Flags()
       : checksum(CHECKSUM_NONE),
@@ -70,7 +77,8 @@ struct Flags {
         check_cached_mmaps(false),
         suppress_environment_warnings(false),
         fatal_errors_and_warnings(false),
-        disable_cpuid_faulting(false) {}
+        disable_cpuid_faulting(false),
+        disable_ptrace_exit_events(false) {}
 
   static const Flags& get() { return singleton; }
 

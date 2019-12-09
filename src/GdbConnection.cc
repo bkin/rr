@@ -21,6 +21,7 @@
 #include <sys/types.h>
 #include <unistd.h>
 
+#include <iomanip>
 #include <sstream>
 #include <vector>
 
@@ -43,6 +44,7 @@ static const char INTERRUPT_CHAR = '\x03';
 const GdbThreadId GdbThreadId::ANY(0, 0);
 const GdbThreadId GdbThreadId::ALL(-1, -1);
 
+#ifdef DEBUG
 static bool request_needs_immediate_response(const GdbRequest* req) {
   switch (req->type) {
     case DREQ_NONE:
@@ -52,6 +54,7 @@ static bool request_needs_immediate_response(const GdbRequest* req) {
       return true;
   }
 }
+#endif
 
 GdbConnection::GdbConnection(pid_t tgid, const Features& features)
     : tgid(tgid),
@@ -177,7 +180,7 @@ void GdbConnection::write_binary_packet(const char* pfx, const uint8_t* data,
   ssize_t buf_num_bytes = 0;
   int i;
 
-  strncpy((char*)buf.data(), pfx, buf.size() - 1);
+  memcpy((char*)buf.data(), pfx, pfx_num_chars);
   buf_num_bytes += pfx_num_chars;
 
   for (i = 0; i < num_bytes; ++i) {
@@ -357,14 +360,21 @@ static void read_binary_data(const uint8_t* payload, const uint8_t* payload_end,
 static GdbThreadId parse_threadid(const char* str, char** endptr) {
   GdbThreadId t;
   char* endp;
+  bool multiprocess = false;
 
   if ('p' == *str) {
+    multiprocess = true;
     ++str;
   }
   t.pid = strtol(str, &endp, 16);
   parser_assert(endp);
   if ('\0' == *endp) {
-    t.tid = -1;
+    if (multiprocess) {
+      t.tid = -1;
+    } else {
+      t.tid = t.pid;
+      t.pid = -1;
+    }
     *endptr = endp;
     return t;
   }
@@ -396,7 +406,7 @@ void GdbConnection::write_xfer_response(const void* data, size_t size,
 }
 
 static string read_target_desc(const char* file_name) {
-  string path = exe_directory() + "../share/rr/" + string(file_name);
+  string path = resource_path() + "share/rr/" + string(file_name);
   stringstream ss;
   FILE* f = fopen(path.c_str(), "r");
   DEBUG_ASSERT(f);
@@ -471,6 +481,18 @@ bool GdbConnection::xfer(const char* name, char* args) {
 
     req = GdbRequest(DREQ_GET_AUXV);
     req.target = query_thread;
+    // XXX handle offset/len here!
+    return true;
+  }
+
+  if (!strcmp(name, "exec-file")) {
+    if (strcmp(mode, "read")) {
+      write_packet("");
+      return false;
+    }
+
+    req = GdbRequest(DREQ_GET_EXEC_FILE);
+    req.target.pid = req.target.tid = strtoul(annex, nullptr, 16);
     // XXX handle offset/len here!
     return true;
   }
@@ -629,16 +651,20 @@ bool GdbConnection::query(char* payload) {
     /* TODO process these */
     LOG(debug) << "gdb supports " << args;
 
+    multiprocess_supported_ = strstr(args, "multiprocess+") != nullptr;
+
     stringstream supported;
     // Encourage gdb to use very large packets since we support any packet size
     supported << "PacketSize=1048576"
                  ";QStartNoAckMode+"
                  ";qXfer:features:read+"
                  ";qXfer:auxv:read+"
+                 ";qXfer:exec-file:read+"
                  ";qXfer:siginfo:read+"
                  ";qXfer:siginfo:write+"
                  ";multiprocess+"
-                 ";ConditionalBreakpoints+";
+                 ";ConditionalBreakpoints+"
+                 ";vContSupported+";
     if (features().reverse_execution) {
       supported << ";ReverseContinue+"
                    ";ReverseStep+";
@@ -759,6 +785,38 @@ bool GdbConnection::process_bpacket(char* payload) {
     UNHANDLED_REQ() << "Unhandled gdb bpacket: b" << payload;
     return false;
   }
+}
+
+static int gdb_open_flags_to_system_flags(int64_t flags) {
+  int ret;
+  switch (flags & 3) {
+    case 0:
+      ret = O_RDONLY;
+      break;
+    case 1:
+      ret = O_WRONLY;
+      break;
+    case 2:
+      ret = O_RDWR;
+      break;
+    default:
+      parser_assert(false);
+      return 0;
+  }
+  parser_assert(!(flags & ~int64_t(3 | 0x8 | 0x200 | 0x400 | 0x800)));
+  if (flags & 0x8) {
+    ret |= O_APPEND;
+  }
+  if (flags & 0x200) {
+    ret |= O_CREAT;
+  }
+  if (flags & 0x400) {
+    ret |= O_TRUNC;
+  }
+  if (flags & 0x800) {
+    ret |= O_EXCL;
+  }
+  return ret;
 }
 
 bool GdbConnection::process_vpacket(char* payload) {
@@ -912,8 +970,61 @@ bool GdbConnection::process_vpacket(char* payload) {
   }
 
   if (name == strstr(name, "File:")) {
-    write_packet("");
-    return false;
+    char* operation = payload + 5;
+    if (operation == strstr(operation, "open:")) {
+      char* file_name_end = strchr(operation + 5, ',');
+      parser_assert(file_name_end != NULL);
+      *file_name_end = 0;
+      req = GdbRequest(DREQ_FILE_OPEN);
+      req.file_open().file_name = decode_ascii_encoded_hex_str(operation + 5);
+      char* flags_end;
+      int64_t flags = strtol(file_name_end + 1, &flags_end, 16);
+      parser_assert(*flags_end == ',');
+      req.file_open().flags = gdb_open_flags_to_system_flags(flags);
+      char* mode_end;
+      int64_t mode = strtol(flags_end + 1, &mode_end, 16);
+      parser_assert(*mode_end == 0);
+      parser_assert((mode & ~(int64_t)0777) == 0);
+      req.file_open().mode = mode;
+      return true;
+    } else if (operation == strstr(operation, "close:")) {
+      char* endptr;
+      int64_t fd = strtol(operation + 6, &endptr, 16);
+      parser_assert(*endptr == 0);
+      req = GdbRequest(DREQ_FILE_CLOSE);
+      req.file_close().fd = fd;
+      parser_assert(req.file_close().fd == fd);
+      return true;
+    } else if (operation == strstr(operation, "pread:")) {
+      char* fd_end;
+      int64_t fd = strtol(operation + 6, &fd_end, 16);
+      parser_assert(*fd_end == ',');
+      req = GdbRequest(DREQ_FILE_PREAD);
+      req.file_pread().fd = fd;
+      parser_assert(req.file_pread().fd == fd);
+      char* size_end;
+      int64_t size = strtol(fd_end + 1, &size_end, 16);
+      parser_assert(*size_end == ',');
+      parser_assert(size >= 0);
+      req.file_pread().size = size;
+      char* offset_end;
+      int64_t offset = strtol(size_end + 1, &offset_end, 16);
+      parser_assert(*offset_end == 0);
+      parser_assert(offset >= 0);
+      req.file_pread().offset = offset;
+      return true;
+    } else if (operation == strstr(operation, "setfs:")) {
+      char* endptr;
+      int64_t pid = strtol(operation + 6, &endptr, 16);
+      parser_assert(*endptr == 0);
+      req = GdbRequest(DREQ_FILE_SETFS);
+      req.file_setfs().pid = pid;
+      parser_assert(req.file_setfs().pid == pid);
+      return true;
+    } else {
+      write_packet("");
+      return false;
+    }
   }
 
   UNHANDLED_REQ() << "Unhandled gdb vpacket: v" << name;
@@ -935,10 +1046,10 @@ static string to_string(const vector<uint8_t>& bytes, size_t max_len) {
 }
 
 bool GdbConnection::process_packet() {
-  parser_assert(INTERRUPT_CHAR == inbuf[0] ||
-                ('$' == inbuf[0] &&
-                 (uint8_t*)memchr(inbuf.data(), '#', inbuf.size()) ==
-                     inbuf.data() + packetend));
+  parser_assert(
+      INTERRUPT_CHAR == inbuf[0] ||
+      ('$' == inbuf[0] && (uint8_t*)memchr(inbuf.data(), '#', inbuf.size()) ==
+                              inbuf.data() + packetend));
 
   if (INTERRUPT_CHAR == inbuf[0]) {
     LOG(debug) << "gdb requests interrupt";
@@ -956,6 +1067,13 @@ bool GdbConnection::process_packet() {
   switch (request) {
     case 'b':
       ret = process_bpacket(payload);
+      break;
+    case 'c':
+      LOG(debug) << "gdb is asking to continue";
+      req = GdbRequest(DREQ_CONT);
+      req.cont().run_direction = RUN_FORWARD;
+      req.cont().actions.push_back(GdbContAction(ACTION_CONTINUE));
+      ret = true;
       break;
     case 'D':
       LOG(debug) << "gdb is detaching from us";
@@ -1181,10 +1299,12 @@ GdbRequest GdbConnection::get_request() {
     return req;
   }
 
-  /* Can't ask for the next request until you've satisfied the
-   * current one, for requests that need an immediate
-   * response. */
+/* Can't ask for the next request until you've satisfied the
+ * current one, for requests that need an immediate
+ * response. */
+#ifdef DEBUG
   DEBUG_ASSERT(!request_needs_immediate_response(&req));
+#endif
 
   if (!sniff_packet() && req.is_resume_request()) {
     /* There's no new request data available and gdb has
@@ -1336,8 +1456,13 @@ void GdbConnection::send_stop_reply_packet(GdbThreadId thread, int sig,
     watch[0] = '\0';
   }
   char buf[PATH_MAX];
-  snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
+  if (multiprocess_supported_) {
+    snprintf(buf, sizeof(buf) - 1, "T%02xthread:p%02x.%02x;%s",
            to_gdb_signum(sig), thread.pid, thread.tid, watch);
+  } else {
+    snprintf(buf, sizeof(buf) - 1, "T%02xthread:%02x;%s",
+           to_gdb_signum(sig), thread.tid, watch);
+  }
   write_packet(buf);
 }
 
@@ -1358,10 +1483,16 @@ void GdbConnection::notify_stop(GdbThreadId thread, int sig,
   // don't do this, gdb will sometimes continue to send requests
   // for the previously-stopped thread when it obviously intends
   // to be making requests about the stopped thread.
-  // Setting to ANY here will make the client choose the correct default thread.
-  LOG(debug) << "forcing query/resume thread to ANY";
-  query_thread = GdbThreadId::ANY;
-  resume_thread = GdbThreadId::ANY;
+  // To make things even better, gdb expects different behavior
+  // for forward continue/interupt and reverse continue.
+  if (req.is_resume_request() && req.cont().run_direction == RUN_BACKWARD) {
+    LOG(debug) << "Setting query/resume_thread to ANY after reverse continue";
+    query_thread = resume_thread = GdbThreadId::ANY;
+  } else {
+    LOG(debug) << "Setting query/resume_thread to " << thread
+               << " after forward continue or interrupt";
+    query_thread = resume_thread = thread;
+  }
 
   consume_request();
 }
@@ -1380,7 +1511,11 @@ void GdbConnection::reply_get_current_thread(GdbThreadId thread) {
   DEBUG_ASSERT(DREQ_GET_CURRENT_THREAD == req.type);
 
   char buf[1024];
-  snprintf(buf, sizeof(buf), "QCp%02x.%02x", thread.pid, thread.tid);
+  if (multiprocess_supported_) {
+    snprintf(buf, sizeof(buf), "QCp%02x.%02x", thread.pid, thread.tid);
+  } else {
+    snprintf(buf, sizeof(buf), "QC%02x", thread.tid);
+  }
   write_packet(buf);
 
   consume_request();
@@ -1391,6 +1526,20 @@ void GdbConnection::reply_get_auxv(const vector<uint8_t>& auxv) {
 
   if (!auxv.empty()) {
     write_binary_packet("l", auxv.data(), auxv.size());
+  } else {
+    write_packet("E01");
+  }
+
+  consume_request();
+}
+
+void GdbConnection::reply_get_exec_file(const string& exec_file) {
+  DEBUG_ASSERT(DREQ_GET_EXEC_FILE == req.type);
+
+  if (!exec_file.empty()) {
+    write_binary_packet("l",
+                        reinterpret_cast<const uint8_t*>(exec_file.c_str()),
+                        exec_file.size());
   } else {
     write_packet("E01");
   }
@@ -1485,7 +1634,8 @@ void GdbConnection::reply_get_reg(const GdbRegisterValue& reg) {
 }
 
 void GdbConnection::reply_get_regs(const vector<GdbRegisterValue>& file) {
-  char buf[file.size() * 2 * GdbRegisterValue::MAX_SIZE + 1];
+  std::unique_ptr<char[]> buf(
+      new char[file.size() * 2 * GdbRegisterValue::MAX_SIZE + 1]);
 
   DEBUG_ASSERT(DREQ_GET_REGS == req.type);
 
@@ -1493,7 +1643,7 @@ void GdbConnection::reply_get_regs(const vector<GdbRegisterValue>& file) {
   for (auto& reg : file) {
     offset += print_reg_value(reg, &buf[offset]);
   }
-  write_packet(buf);
+  write_packet(buf.get());
 
   consume_request();
 }
@@ -1524,31 +1674,28 @@ void GdbConnection::reply_get_stop_reason(GdbThreadId which, int sig) {
 
 void GdbConnection::reply_get_thread_list(const vector<GdbThreadId>& threads) {
   DEBUG_ASSERT(DREQ_GET_THREAD_LIST == req.type);
-
   if (threads.empty()) {
     write_packet("l");
   } else {
-    ssize_t maxlen =
-        1 /*m char*/ +
-        threads.size() * (1 /*p*/ + 2 * sizeof(threads[0]) + 1 /*,*/) +
-        1 /*\0*/;
-    char* str = (char*)xmalloc(maxlen);
-    int offset = 0;
-
-    str[offset++] = 'm';
+    stringstream sstr;
+    sstr << 'm';
     for (size_t i = 0; i < threads.size(); ++i) {
       const GdbThreadId& t = threads[i];
       if (tgid != t.pid) {
         continue;
       }
-      offset +=
-          snprintf(&str[offset], maxlen - offset, "p%02x.%02x,", t.pid, t.tid);
+      if (multiprocess_supported_) {
+        sstr << 'p' << setw(2) << setfill('0') << hex << t.pid << dec << '.'
+            << setw(2) << setfill('0') << hex << t.tid << ',';
+      } else {
+        sstr << setw(2) << setfill('0') << hex << t.tid << ',';
+      }
     }
-    /* Overwrite the trailing ',' */
-    str[offset - 1] = '\0';
 
-    write_packet(str);
-    free(str);
+    string str = sstr.str();
+    /* Overwrite the trailing ',' */
+    str.back() = 0;
+    write_packet(str.c_str());
   }
 
   consume_request();
@@ -1628,6 +1775,123 @@ void GdbConnection::reply_tls_addr(bool ok, remote_ptr<void> address) {
   }
 
   consume_request();
+}
+
+void GdbConnection::reply_setfs(int err) {
+  DEBUG_ASSERT(DREQ_FILE_SETFS == req.type);
+  if (err) {
+    send_file_error_reply(err);
+  } else {
+    write_packet("F0");
+  }
+
+  consume_request();
+}
+
+void GdbConnection::reply_open(int fd, int err) {
+  DEBUG_ASSERT(DREQ_FILE_OPEN == req.type);
+  if (err) {
+    send_file_error_reply(err);
+  } else {
+    char buf[32];
+    sprintf(buf, "F%x", fd);
+    write_packet(buf);
+  }
+
+  consume_request();
+}
+
+void GdbConnection::reply_pread(const uint8_t* bytes, ssize_t len, int err) {
+  DEBUG_ASSERT(DREQ_FILE_PREAD == req.type);
+  if (err) {
+    send_file_error_reply(err);
+  } else {
+    char buf[32];
+    sprintf(buf, "F%llx;", (long long)len);
+    write_binary_packet(buf, bytes, len);
+  }
+
+  consume_request();
+}
+
+void GdbConnection::reply_close(int err) {
+  DEBUG_ASSERT(DREQ_FILE_CLOSE == req.type);
+  if (err) {
+    send_file_error_reply(err);
+  } else {
+    write_packet("F0");
+  }
+
+  consume_request();
+}
+
+void GdbConnection::send_file_error_reply(int system_errno) {
+  int gdb_err;
+  switch (system_errno) {
+    case EPERM:
+      gdb_err = 1;
+      break;
+    case ENOENT:
+      gdb_err = 2;
+      break;
+    case EINTR:
+      gdb_err = 4;
+      break;
+    case EBADF:
+      gdb_err = 9;
+      break;
+    case EACCES:
+      gdb_err = 13;
+      break;
+    case EFAULT:
+      gdb_err = 14;
+      break;
+    case EBUSY:
+      gdb_err = 16;
+      break;
+    case EEXIST:
+      gdb_err = 17;
+      break;
+    case ENODEV:
+      gdb_err = 19;
+      break;
+    case ENOTDIR:
+      gdb_err = 20;
+      break;
+    case EISDIR:
+      gdb_err = 21;
+      break;
+    case EINVAL:
+      gdb_err = 22;
+      break;
+    case ENFILE:
+      gdb_err = 23;
+      break;
+    case EMFILE:
+      gdb_err = 24;
+      break;
+    case EFBIG:
+      gdb_err = 27;
+      break;
+    case ENOSPC:
+      gdb_err = 28;
+      break;
+    case ESPIPE:
+      gdb_err = 29;
+      break;
+    case EROFS:
+      gdb_err = 30;
+      break;
+    case ENAMETOOLONG:
+      gdb_err = 91;
+      break;
+    default:
+      gdb_err = 9999;
+      break;
+  }
+  char buf[32];
+  sprintf(buf, "F-01,%x", gdb_err);
+  write_packet(buf);
 }
 
 bool GdbConnection::is_connection_alive() { return connection_alive_; }

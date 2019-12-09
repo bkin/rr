@@ -5,6 +5,7 @@
 
 #include <unistd.h>
 
+#include <map>
 #include <memory>
 #include <set>
 #include <string>
@@ -21,8 +22,10 @@
 namespace rr {
 
 struct CPUIDRecord;
+struct DisableCPUIDFeatures;
 class KernelMapping;
 class RecordTask;
+struct TraceUuid;
 
 /**
  * TraceStream stores all the data common to both recording and
@@ -89,9 +92,9 @@ public:
     /** Name of file to map the data from. */
     string file_name;
     /** Data offset within |file_name|. */
-    uint64_t data_offset_bytes;
+    size_t data_offset_bytes;
     /** Original size of mapped file. */
-    uint64_t file_size_bytes;
+    size_t file_size_bytes;
   };
 
 protected:
@@ -130,6 +133,42 @@ protected:
   FrameTime global_time;
 };
 
+struct TraceRemoteFd {
+  pid_t tid;
+  int fd;
+};
+
+/**
+ * Trace writing takes the trace directory through a defined set of states.
+ * These states can be usefully observed by external programs.
+ *
+ * -- Initially the trace directory does not exist.
+ * -- The trace directory is created. It is empty.
+ * -- A file `incomplete` is created in the trace directory. It is empty.
+ * -- rr takes an exclusive flock() lock on `incomplete`.
+ * -- rr writes data to `incomplete` so it is no longer empty. (At this
+ * point the data is undefined.) rr may write to the file at any
+ * time during recording.
+ * -- At the end of trace recording, rr renames `incomplete` to `version`.
+ * At this point the trace is complete and ready to replay.
+ * -- rr releases its flock() lock on `version`.
+ *
+ * Thus:
+ * -- If the trace directory contains the file `version` the trace is valid
+ * and ready for replay.
+ * -- If the trace directory contains the file `incomplete`, and there is an
+ * exclusive flock() lock on that file, rr is still recording (or something
+ * is messing with us).
+ * -- If the trace directory contains the file `incomplete`, that file
+ * does not have an exclusive `flock()` lock on it, and the file is non-empty,
+ * rr must have died before the recording was complete.
+ * -- If the trace directory contains the file `incomplete`, that file
+ * does not have an exclusive `flock()` lock on it, and the file is empty,
+ * rr has just started recording (or perhaps died during startup).
+ * -- If the trace directory does not contain the file `incomplete`,
+ * rr has just started recording (or perhaps died during startup) (or perhaps
+ * that isn't a trace directory at all).
+ */
 class TraceWriter : public TraceStream {
 public:
   bool supports_file_data_cloning() { return supports_file_data_cloning_; }
@@ -140,8 +179,7 @@ public:
    * Recording a trace frame has the side effect of ticking
    * the global time.
    */
-  void write_frame(pid_t tid, SupportedArch arch, const Event& ev,
-                   Ticks tick_count, const Registers* registers,
+  void write_frame(RecordTask* t, const Event& ev, const Registers* registers,
                    const ExtraRegisters* extra_registers);
 
   enum RecordInTrace { DONT_RECORD_IN_TRACE, RECORD_IN_TRACE };
@@ -160,10 +198,13 @@ public:
    */
   RecordInTrace write_mapped_region(RecordTask* t, const KernelMapping& map,
                                     const struct stat& stat,
-                                    MappingOrigin origin = SYSCALL_MAPPING);
+                                    const std::vector<TraceRemoteFd>& extra_fds,
+                                    MappingOrigin origin = SYSCALL_MAPPING,
+                                    bool skip_monitoring_mapped_fd = false);
 
   static void write_mapped_region_to_alternative_stream(
-      CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km);
+      CompressedWriter& mmaps, const MappedData& data, const KernelMapping& km,
+      const std::vector<TraceRemoteFd>& extra_fds, bool skip_monitoring_mapped_fd);
 
   /**
    * Write a raw-data record to the trace.
@@ -183,21 +224,38 @@ public:
    */
   bool good() const;
 
+  /**
+   * Create a trace where the tracess are bound to cpu |bind_to_cpu|. This
+   * data is recorded in the trace. If |bind_to_cpu| is -1 then the tracees
+   * were not bound.
+   * The trace name is determined by |file_name| and _RR_TRACE_DIR (if set)
+   * or by setting -o=<OUTPUT_TRACE_DIR>.
+   */
+  TraceWriter(const std::string& file_name, int bind_to_cpu,
+              const string& output_trace_dir, TicksSemantics ticks_semantics_);
+
+  /**
+   * Called after the calling thread is actually bound to |bind_to_cpu|.
+   */
+  void setup_cpuid_records(bool has_cpuid_faulting,
+                           const DisableCPUIDFeatures& disable_cpuid_features);
+
+  enum CloseStatus {
+    /**
+     * Trace completed normally and can be replayed.
+     */
+    CLOSE_OK,
+    /**
+     * Trace completed abnormally due to rr error.
+     */
+    CLOSE_ERROR
+  };
   /** Call close() on all the relevant trace files.
    *  Normally this will be called by the destructor. It's helpful to
    *  call this before a crash that won't call the destructor, to ensure
    *  buffered data is flushed.
    */
-  void close();
-
-  /**
-   * Create a trace where the tracess are bound to cpu |bind_to_cpu|. This
-   * data is recorded in the trace. If |bind_to_cpu| is -1 then the tracees
-   * were not bound.
-   * The trace name is determined by |file_name| and _RR_TRACE_DIR (if set).
-   */
-  TraceWriter(const std::string& file_name, int bind_to_cpu,
-              bool has_cpuid_faulting);
+  void close(CloseStatus status, const TraceUuid* uuid);
 
   /**
    * We got far enough into recording that we should set this as the latest
@@ -205,10 +263,13 @@ public:
    */
   void make_latest_trace();
 
+  TicksSemantics ticks_semantics() const { return ticks_semantics_; }
+
 private:
-  std::string try_hardlink_file(const std::string& file_name);
+  bool try_hardlink_file(const std::string& file_name, std::string* new_name);
   bool try_clone_file(RecordTask* t, const std::string& file_name,
                       std::string* new_name);
+  bool copy_file(const std::string& file_name, std::string* new_name);
 
   CompressedWriter& writer(Substream s) { return *writers[s]; }
   const CompressedWriter& writer(Substream s) const { return *writers[s]; }
@@ -217,10 +278,19 @@ private:
   /**
    * Files that have already been mapped without being copied to the trace,
    * i.e. that we have already assumed to be immutable.
+   * We store the file name under which we assumed it to be immutable, since
+   * a file may be accessed through multiple names, only some of which
+   * are immutable.
    */
-  std::set<std::pair<dev_t, ino_t>> files_assumed_immutable;
+  std::map<std::pair<dev_t, ino_t>, std::string> files_assumed_immutable;
   std::vector<RawDataMetadata> raw_recs;
+  std::vector<CPUIDRecord> cpuid_records;
+  TicksSemantics ticks_semantics_;
+  // Keep the 'incomplete' (later renamed to 'version') file open until we
+  // rename it, so our flock() lock stays held on it.
+  ScopedFd version_fd;
   uint32_t mmap_count;
+  bool has_cpuid_faulting_;
   bool supports_file_data_cloning_;
 };
 
@@ -256,13 +326,16 @@ public:
   KernelMapping read_mapped_region(
       MappedData* data = nullptr, bool* found = nullptr,
       ValidateSourceFile validate = VALIDATE,
-      TimeConstraint time_constraint = CURRENT_TIME_ONLY);
+      TimeConstraint time_constraint = CURRENT_TIME_ONLY,
+      std::vector<TraceRemoteFd>* extra_fds = nullptr,
+      bool* skip_monitoring_mapped_fd = nullptr);
 
   /**
    * Read a task event (clone or exec record) from the trace.
    * Returns a record of type NONE at the end of the trace.
+   * Sets |*time| (if non-null) to the global time of the event.
    */
-  TraceTaskEvent read_task_event();
+  TraceTaskEvent read_task_event(FrameTime* time = nullptr);
 
   /**
    * Read the next raw data record for this frame and return it. Aborts if
@@ -327,16 +400,34 @@ public:
     return cpuid_records_;
   }
   bool uses_cpuid_faulting() const { return trace_uses_cpuid_faulting; }
+  uint64_t xcr0() const;
+  // Prior to issue 2370, we did not emit mapping into the trace for the
+  // preload_thread_locals mapping if it was created by a clone(2) without
+  // CLONE_VM. This is true if that has been fixed.
+  bool preload_thread_locals_recorded() const { return preload_thread_locals_recorded_; }
+  const TraceUuid& uuid() const { return *uuid_; }
+
+  TicksSemantics ticks_semantics() const { return ticks_semantics_; }
+
+  double recording_time() const { return monotonic_time_; }
 
 private:
   CompressedReader& reader(Substream s) { return *readers[s]; }
   const CompressedReader& reader(Substream s) const { return *readers[s]; }
 
+  uint64_t xcr0_;
   std::unique_ptr<CompressedReader> readers[SUBSTREAM_COUNT];
   std::vector<CPUIDRecord> cpuid_records_;
   std::vector<RawDataMetadata> raw_recs;
+  TicksSemantics ticks_semantics_;
+  double monotonic_time_;
+  std::unique_ptr<TraceUuid> uuid_;
   bool trace_uses_cpuid_faulting;
+  bool preload_thread_locals_recorded_;
 };
+
+extern std::string trace_save_dir();
+extern std::string resolve_trace_name(const std::string& trace_name);
 
 } // namespace rr
 

@@ -40,11 +40,11 @@ function delay_kill { sig=$1; delay_secs=$2; proc=$3
     done
 
     if [[ "$num" -gt 1 ]]; then
-        leave_data=y
+        test_passed=n
         echo FAILED: "$num" of "'$proc'" >&2
         exit 1
     elif [[ -z "$pid" ]]; then
-        leave_data=y
+        test_passed=n
         echo FAILED: process "'$proc'" not located >&2
         exit 1
     fi
@@ -73,12 +73,13 @@ function fatal { #...
 
 function onexit {
     cd
-    if [[ "$leave_data" != "y" ]]; then
+    if [[ "$test_passed" == "y" ]]; then
         rm -rf $workdir
     else
         echo Test $TESTNAME failed, leaving behind $workdir
         echo To replay the failed test, run
         echo " " _RR_TRACE_DIR="$workdir" rr replay
+        exit 1
     fi
 }
 
@@ -90,19 +91,7 @@ function usage {
     echo Usage: "util.sh TESTNAME [LIB_ARG] [OBJDIR]"
 }
 
-DEFAULT_FLAGS="--suppress-environment-warnings --check-cached-mmaps --fatal-errors"
-# Don't bind record/replay tracees to the same logical CPU.  When we
-# do that, the tests take impractically long to run.
-#
-# TODO: find a way to run faster with CPU binding
-GLOBAL_OPTIONS="$DEFAULT_FLAGS"
-# ... but tests that DO want CPU binding can override the default by
-# setting
-#
-#   GLOBAL_OPTIONS="$GLOBAL_OPTIONS_BIND_CPU"
-#
-# just after sourcing this file.
-GLOBAL_OPTIONS_BIND_CPU="$DEFAULT_FLAGS"
+GLOBAL_OPTIONS="--suppress-environment-warnings --check-cached-mmaps --fatal-errors"
 
 SRCDIR=`dirname $0`/../..
 SRCDIR=`realpath $SRCDIR`
@@ -126,11 +115,12 @@ OBJDIR=$3
 if [[ "$OBJDIR" == "" ]]; then
     # Default to assuming that the user's working directory is the
     # src/test/ directory within the rr clone.
-    OBJDIR=`realpath $SRCDIR/../obj`
+    OBJDIR="$SRCDIR/../obj"
 fi
 if [[ ! -d "$OBJDIR" ]]; then
     fatal "FAILED: objdir missing"
 fi
+OBJDIR=`realpath $OBJDIR`
 TIMEOUT=$4
 if [[ "$TIMEOUT" == "" ]]; then
     TIMEOUT=120
@@ -139,8 +129,9 @@ fi
 # The temporary directory we create for this test run.
 workdir=
 # Did the test pass?  If not, then we'll leave the recording and
-# output around for developers to debug.
-leave_data=n
+# output around for developers to debug, and exit with a nonzero
+# exit code.
+test_passed=y
 # The unique ID allocated to this test directory.
 nonce=
 
@@ -150,7 +141,10 @@ TESTDIR="${SRCDIR}/src/test"
 # Make rr treat temp files as durable. This saves copying all test
 # binaries into the trace.
 export RR_TRUST_TEMP_FILES=1
+
+# Set options to find rr and resource files in the expected places.
 export PATH="${OBJDIR}/bin:${PATH}"
+GLOBAL_OPTIONS="${GLOBAL_OPTIONS} --resource-path=${OBJDIR}"
 
 which rr >/dev/null 2>&1
 if [[ "$?" != "0" ]]; then
@@ -248,7 +242,7 @@ function do_ps { psflags=$1
 # Load the "expect" script to drive replay of the recording of |exe|.
 function debug { expectscript=$1; replayargs=$2
     _RR_TRACE_DIR="$workdir" test-monitor $TIMEOUT debug.err \
-        python2 $TESTDIR/$expectscript.py \
+        python3 $TESTDIR/$expectscript.py \
         rr $GLOBAL_OPTIONS replay -o-n -x $TESTDIR/test_setup.gdb $replayargs
     if [[ $? == 0 ]]; then
         passed
@@ -265,7 +259,7 @@ function debug { expectscript=$1; replayargs=$2
 }
 
 function failed { msg=$1;
-    leave_data=y
+    test_passed=n
     echo "Test '$TESTNAME' FAILED: $msg"
 }
 
@@ -385,7 +379,7 @@ function checkpoint_test { exe=$1; min=$2; max=$3;
     for i in $(seq 1 $stride $num_events); do
         echo Checkpointing at event $i ...
         debug restart_finish "-g $i"
-        if [[ "$leave_data" == "y" ]]; then
+        if [[ "$test_passed" != "y" ]]; then
             break
         fi
     done

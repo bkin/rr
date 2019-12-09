@@ -33,6 +33,13 @@ using Ticks = Int64;
 # Must be >= 0
 using Fd = Int32;
 
+# Describes what "ticks" mean in this trace
+enum TicksSemantics {
+  retiredConditionalBranches @0;
+  # Excludes interrupts, far branches, and rets
+  takenBranches @1;
+}
+
 # The 'version' file contains an ASCII version number followed by a newline.
 # The version number is currently 85 and increments only when there's a
 # backwards-incompatible change. See TRACE_VERSION.
@@ -51,8 +58,23 @@ struct Header {
   # A list of captured CPUID values.
   # A series of 24-byte records. See CPUIDRecord in util.h.
   cpuidRecords @3 :Data;
+  # Captured XCR0 value defining XSAVE features enabled by OS.
+  # 0 means "unknown"; default to everything supported by CPUID EAX=0xd ECX=0
+  xcr0 @5 :UInt64;
+  # Semantics of "ticks" in this trace
+  ticksSemantics @6 :TicksSemantics;
   # The syscallbuf protocol version. See SYSCALLBUF_PROTOCOL_VERSION.
   syscallbufProtocolVersion @4 :UInt16;
+  # Trace recorded OK. False if rr crashed out due to an fatal assertion etc.
+  ok @7 :Bool = true;
+  # Do the mappings of preload_thread_locals always appear in the trace?
+  preloadThreadLocalsRecorded @8 :Bool = false;
+}
+
+# A file descriptor belonging to a task
+struct RemoteFd {
+  tid @0 :Tid;
+  fd @1 :Int32;
 }
 
 # The 'mmaps', 'tasks' and 'events' files consist of a series of chunks.
@@ -92,6 +114,11 @@ struct MMap {
       backingFileName @16 :Path;
     }
   }
+  # File descriptors pointing to this mapping, other than the one
+  # that was mapped (for non-anonymous mappings).
+  extraFds @17 :List(RemoteFd);
+  # True if the mapped fd was read-only and should not be monitored
+  skipMonitoringMappedFd @18 :Bool;
 }
 
 # The 'tasks' file is a sequence of these.
@@ -108,7 +135,14 @@ struct TaskEvent {
       # Not a Path since it is only meaningful during recording
       fileName @5 :CString;
       cmdLine @6 :List(CString);
+      # Start address of executable mapping from /proc/.../exe
+      # Never null (in traces that support the field)
+      # Added after 5.0.0
+      exeBase @8 :RemotePtr;
     }
+    # Most frame 'exit' events generate one of these, but these are not
+    # generated if rr ends abnormally so the tasks did not in fact exit during
+    # recording.
     exit :group {
       exitStatus @7 :Int32;
     }
@@ -165,6 +199,10 @@ struct OpenedFd {
   # Absolute pathname, or "terminal" if we opened the terminal in some way
   # Not a Path since it is only meaningful during recording
   path @1 :CString;
+  # These are used to associate an opened fd with the right mapped file.
+  # May be zero for legacy recordings!
+  device @2 :Device;
+  inode @3 :Inode;
 }
 
 # The 'events' file is a sequence of these.

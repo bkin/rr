@@ -97,7 +97,13 @@ struct FcntlConstants {
     OFD_SETLKW = 38,
     // Other Linux-specific operations
     DUPFD_CLOEXEC = 0x400 + 6,
-    ADD_SEALS = 0x400 + 9
+    SETPIPE_SZ = 0x400 + 7,
+    GETPIPE_SZ = 0x400 + 8,
+    ADD_SEALS = 0x400 + 9,
+    GET_RW_HINT = 0x400 + 11,
+    SET_RW_HINT = 0x400 + 12,
+    GET_FILE_RW_HINT = 0x400 + 13,
+    SET_FILE_RW_HINT = 0x400 + 14,
   };
 };
 
@@ -181,6 +187,12 @@ struct WordSize32Defs {
     uint32_t d_val;
   } ElfDyn;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Dyn, ElfDyn);
+  typedef struct {
+    uint32_t n_namesz;
+    uint32_t n_descsz;
+    uint32_t n_type;
+  } ElfNhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf32_Nhdr, ElfNhdr);
 };
 
 struct WordSize64Defs {
@@ -254,6 +266,12 @@ struct WordSize64Defs {
     uint64_t d_val;
   } ElfDyn;
   RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Dyn, ElfDyn);
+  typedef struct {
+    uint32_t n_namesz;
+    uint32_t n_descsz;
+    uint32_t n_type;
+  } ElfNhdr;
+  RR_VERIFY_TYPE_ARCH(RR_NATIVE_ARCH, ::Elf64_Nhdr, ElfNhdr);
 };
 
 /**
@@ -292,6 +310,7 @@ struct BaseArch : public wordsize,
   typedef syscall_ulong_t nlink_t;
 
   typedef int64_t off64_t;
+  typedef int64_t loff_t;
   typedef uint64_t rlim64_t;
   typedef uint64_t ino64_t;
   typedef int64_t blkcnt64_t;
@@ -308,7 +327,9 @@ struct BaseArch : public wordsize,
   typedef signed_int __kernel_pid_t;
   typedef int64_t __kernel_loff_t;
 
-  typedef unsigned_int __u32;
+  typedef uint32_t __u32;
+  typedef uint64_t __u64;
+  typedef __u64 aligned_u64 __attribute((aligned(8)));
 
   template <typename T> struct ptr {
     typedef T Referent;
@@ -320,6 +341,25 @@ struct BaseArch : public wordsize,
      */
     remote_ptr<T> rptr() const { return remote_ptr<T>(val); }
     template <typename U> ptr<T>& operator=(remote_ptr<U> p) {
+      remote_ptr<T> pt = p;
+      val = pt.as_int();
+      DEBUG_ASSERT(val == pt.as_int());
+      return *this;
+    }
+    operator bool() const { return val; }
+    static size_t referent_size() { return sizeof(T); }
+  };
+
+  template <typename T> struct ptr64 {
+    typedef T Referent;
+    aligned_u64 val;
+    template <typename U> operator remote_ptr<U>() const { return rptr(); }
+    /**
+     * Sometimes you need to call rptr() directly to resolve ambiguous
+     * overloading.
+     */
+    remote_ptr<T> rptr() const { return remote_ptr<T>(val); }
+    template <typename U> ptr64<T>& operator=(remote_ptr<U> p) {
       remote_ptr<T> pt = p;
       val = pt.as_int();
       DEBUG_ASSERT(val == pt.as_int());
@@ -1043,7 +1083,7 @@ struct BaseArch : public wordsize,
     ptr<size_t> oldlenp;
     ptr<void> newval;
     ptr<size_t> newlen;
-    unsigned_long __unused[4];
+    unsigned_long __rr_unused[4];
   };
   RR_VERIFY_TYPE(__sysctl_args);
 
@@ -1466,6 +1506,113 @@ struct BaseArch : public wordsize,
     int : 32;
   } timex;
   RR_VERIFY_TYPE(timex);
+
+  typedef struct statx_timestamp {
+    int64_t tv_sec;
+    uint32_t tv_nsec;
+    int32_t __reserved;
+  } statx_timestamp;
+  // statx_timestamp not yet widely available in system headers
+  // RR_VERIFY_TYPE(statx_timestamp);
+
+  typedef struct statx_struct {
+    uint32_t stx_mask;
+    uint32_t stx_blksize;
+    uint64_t stx_attributes;
+    uint32_t stx_nlink;
+    uint32_t stx_uid;
+    uint32_t stx_gid;
+    uint16_t stx_mode;
+    uint16_t __spare0;
+    uint64_t stx_ino;
+    uint64_t stx_size;
+    uint64_t stx_blocks;
+    uint64_t stx_attributes_mask;
+    statx_timestamp stx_atime;
+    statx_timestamp stx_btime;
+    statx_timestamp stx_ctime;
+    statx_timestamp stx_mtime;
+    uint32_t stx_rdev_major;
+    uint32_t stx_rdev_minor;
+    uint32_t stx_dev_major;
+    uint32_t stx_dev_minor;
+    uint64_t __spare2[14];
+  } statx;
+  // statx not yet widely available in system headers
+  // RR_VERIFY_TYPE(statx);
+
+  struct sg_io_hdr {
+    int interface_id;
+    int dxfer_direction;
+    unsigned char cmd_len;
+    unsigned char mx_sb_len;
+    unsigned short int iovec_count;
+    unsigned int dxfer_len;
+    ptr<void> dxferp;
+    ptr<unsigned char> cmdp;
+    ptr<unsigned char> sbp;
+    unsigned int timeout;
+    unsigned int flags;
+    int pack_id;
+    ptr<void> usr_ptr;
+    unsigned char status;
+    unsigned char masked_status;
+    unsigned char msg_status;
+    unsigned char sb_len_wr;
+    unsigned short int host_status;
+    unsigned short int driver_status;
+    int resid;
+    unsigned int duration;
+    unsigned int info;
+  };
+  RR_VERIFY_TYPE(sg_io_hdr);
+
+  union bpf_attr {
+    struct {
+      __u32 map_type;
+      __u32 key_size;
+      __u32 value_size;
+      __u32 max_entries;
+      __u32 map_flags;
+      __u32 inner_map_fd;
+      __u32 numa_node;
+      char map_name[16];
+      __u32 map_ifindex;
+      __u32 btf_fd;
+      __u32 btf_key_type_id;
+      __u32 btf_value_type_id;
+    };
+    struct {
+      __u32 map_fd;
+      ptr64<void> key;
+      union {
+        ptr64<void> value;
+        ptr64<void> next_key;
+      };
+      __u64 flags;
+    };
+    struct {
+      __u32 prog_type;
+      __u32 insn_cnt;
+      ptr64<void> insns;
+      ptr64<const char> license;
+      __u32 log_level;
+      __u32 log_size;
+      ptr64<char> log_buf;
+      __u32 kern_version;
+      __u32 prog_flags;
+      char prog_name[16];
+      __u32 prog_ifindex;
+      __u32 expected_attach_type;
+      __u32 prog_btf_fd;
+      __u32 func_info_rec_size;
+      aligned_u64 func_info;
+      __u32 func_info_cnt;
+      __u32 line_info_rec_size;
+      aligned_u64 line_info;
+      __u32 line_info_cnt;
+    };
+  };
 };
 
 struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
@@ -1571,42 +1718,6 @@ struct X86Arch : public BaseArch<SupportedArch::x86, WordSize32Defs> {
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86, ::sigcontext, sigcontext);
 
-  struct ucontext {
-    uint32_t uc_flags;
-    uint32_t uc_link;
-    stack_t uc_stack;
-    sigcontext uc_mcontext;
-    kernel_sigset_t uc_sigmask;
-  };
-
-  struct rt_sigframe {
-    uint32_t pretcode;
-    int sig;
-    uint32_t pinfo;
-    uint32_t puc;
-    siginfo_t info;
-    struct ucontext uc;
-  };
-
-  struct _fpstate_32 {
-    uint32_t cw, sw, tag, ipoff, cssel, dataoff, datasel;
-    uint16_t _st[40];
-    uint16_t status, magic;
-    uint32_t _fxsr_env[6], mxcsr, reserved;
-    uint32_t _fxsr_st[32];
-    uint32_t _xmm[32];
-    uint32_t padding[56];
-  };
-
-  struct sigframe {
-    uint32_t pretcode;
-    int sig;
-    sigcontext sc;
-    _fpstate_32 unused;
-    uint32_t extramask;
-    char retcode[8];
-  };
-
   struct user {
     user_regs_struct regs;
     int u_fpvalid;
@@ -1684,12 +1795,6 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
 
 #include "SyscallEnumsX64.generated"
 
-  // The kernel defines the segment registers and eflags as 64-bit quantities,
-  // even though the segment registers are really 16-bit and eflags is
-  // architecturally defined as 32-bit.  GDB wants the segment registers and
-  // eflags to appear as 32-bit quantities.  From the perspective of providing
-  // registers to GDB, it's easier if we define these registers as uint32_t
-  // with extra padding.
   struct user_regs_struct {
     uint64_t r15;
     uint64_t r14;
@@ -1710,25 +1815,18 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     // signed in practice.
     uint64_t orig_rax;
     uint64_t rip;
-    uint32_t cs;
-    uint32_t cs_upper;
-    uint32_t eflags;
-    uint32_t eflags_upper;
+    uint64_t cs;
+    uint64_t eflags;
     uint64_t rsp;
-    uint32_t ss;
-    uint32_t ss_upper;
+    uint64_t ss;
     // These _base registers are architecturally defined MSRs and really do
     // need to be 64-bit.
     uint64_t fs_base;
     uint64_t gs_base;
-    uint32_t ds;
-    uint32_t ds_upper;
-    uint32_t es;
-    uint32_t es_upper;
-    uint32_t fs;
-    uint32_t fs_upper;
-    uint32_t gs;
-    uint32_t gs_upper;
+    uint64_t ds;
+    uint64_t es;
+    uint64_t fs;
+    uint64_t gs;
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_regs_struct,
                       user_regs_struct);
@@ -1781,22 +1879,6 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::user_fpregs_struct,
                       user_fpregs_struct);
 
-  struct ucontext {
-    uint64_t ucflags;
-    ptr<struct ucontext> uc_link;
-    stack_t uc_stack;
-    struct sigcontext uc_mcontext;
-    sigset_t uc_sigmask;
-    user_fpregs_struct uc_fpregs;
-  };
-  RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, ::ucontext, ucontext);
-
-  struct rt_sigframe {
-    ptr<char> pretcode;
-    struct ucontext uc;
-    siginfo_t info;
-  };
-
   struct user {
     struct user_regs_struct regs;
     int u_fpvalid;
@@ -1837,7 +1919,7 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-    syscall_slong_t __unused[3];
+    syscall_slong_t __rr_unused[3];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat, struct stat);
 
@@ -1856,7 +1938,7 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
     struct timespec st_atim;
     struct timespec st_mtim;
     struct timespec st_ctim;
-    syscall_slong_t __unused[3];
+    syscall_slong_t __rr_unused[3];
   };
   RR_VERIFY_TYPE_ARCH(SupportedArch::x86_64, struct ::stat64, struct stat64);
 };
@@ -1865,6 +1947,7 @@ struct X64Arch : public BaseArch<SupportedArch::x86_64, WordSize64Defs> {
   switch (arch) {                                                              \
     default:                                                                   \
       DEBUG_ASSERT(0 && "Unknown architecture");                               \
+      RR_FALLTHROUGH;                                                          \
     case x86:                                                                  \
       return f<rr::X86Arch>(args);                                             \
     case x86_64:                                                               \

@@ -15,16 +15,16 @@ def expect_rr(what):
     expect(gdb_rr, what)
 
 def failed(why, e=None):
-    print 'FAILED:', why
+    print('FAILED:', why)
     if e:
-        print 'exception:', e
+        print('exception:', e)
     clean_up()
     sys.exit(1)
 
 def interrupt_gdb():
     try:
         gdb_rr.kill(signal.SIGINT)
-    except Exception, e:
+    except Exception as e:
         failed('interrupting gdb', e)
     expect_gdb('stopped.')
 
@@ -69,11 +69,14 @@ def clean_up():
     iterations = 0
     while gdb_rr:
         try:
+            # FIXME: without this sleep python freezes instead of exiting.
+            # The sleep has to be before BufferedRWPair.close()
+            time.sleep(0.1)
             gdb_rr.close(force=1)
             gdb_rr = None
-        except Exception, e:
+        except Exception as e:
             if iterations < 5:
-                print "close() failed with '%s', retrying..."%e
+                print("close() failed with '%s', retrying..."%e)
                 iterations = iterations + 1
             else:
                 gdb_rr = None
@@ -81,7 +84,7 @@ def clean_up():
 def expect(prog, what):
     try:
         prog.expect(what)
-    except Exception, e:
+    except Exception as e:
         failed('expecting "%s"'% (what), e)
 
 def get_exe_arch():
@@ -99,15 +102,16 @@ def get_rr_cmd():
 def send(prog, what):
     try:
         prog.send(what)
-    except Exception, e:
+    except Exception as e:
         failed('sending "%s"'% (what), e)
 
 def set_up():
     global gdb_rr
     try:
-        gdb_rr = pexpect.spawn(*get_rr_cmd(), timeout=TIMEOUT_SEC, logfile=open('gdb_rr.log', 'w'))
-        expect_gdb(r'\(rr\)')
-    except Exception, e:
+        gdb_rr = pexpect.spawn(*get_rr_cmd(), timeout=TIMEOUT_SEC, encoding='utf-8', logfile=open('gdb_rr.log', 'w'))
+        gdb_rr.delaybeforesend = 0
+        expect_gdb('\(rr\)')
+    except Exception as e:
         failed('initializing rr and gdb', e)
 
 set_up()

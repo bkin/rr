@@ -1,5 +1,7 @@
 /* -*- Mode: C++; tab-width: 8; c-basic-offset: 2; indent-tabs-mode: nil; -*- */
 
+#include "ReplayCommand.h"
+
 #include <sys/prctl.h>
 #include <sys/time.h>
 #include <sys/wait.h>
@@ -20,18 +22,6 @@
 using namespace std;
 
 namespace rr {
-
-static int DUMP_STATS_PERIOD = 0;
-
-class ReplayCommand : public Command {
-public:
-  virtual int run(vector<string>& args) override;
-
-protected:
-  ReplayCommand(const char* name, const char* help) : Command(name, help) {}
-
-  static ReplayCommand singleton;
-};
 
 ReplayCommand ReplayCommand::singleton(
     "replay",
@@ -60,6 +50,8 @@ ReplayCommand ReplayCommand::singleton(
     "Emacs\n"
     "  -d, --debugger=<FILE>      use <FILE> as the gdb command\n"
     "  -q, --no-redirect-output   don't replay writes to stdout/stderr\n"
+    "  -h, --dbghost=<HOST>       listen address for the debug server.\n"
+    "                             default listen address is set to localhost.\n"
     "  -s, --dbgport=<PORT>       only start a debug server on <PORT>,\n"
     "                             don't automatically launch the debugger\n"
     "                             client; set PORT to 0 to automatically\n"
@@ -69,7 +61,12 @@ ReplayCommand ReplayCommand::singleton(
     "  -t, --trace=<EVENT>        singlestep instructions and dump register\n"
     "                             states when replaying towards <EVENT> or\n"
     "                             later\n"
-    "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n");
+    "  -u, --cpu-unbound          allow replay to run on any CPU. Default is\n"
+    "                             to run on the CPU stored in the trace.\n"
+    "                             Note that this may diverge from the recording\n"
+    "                             in some cases.\n"
+    "  -x, --gdb-x=<FILE>         execute gdb commands from <FILE>\n"
+    "  --stats=<N>                display brief stats every N steps (eg 10000).\n");
 
 struct ReplayFlags {
   // Start a debug server for the task scheduled at the first
@@ -98,6 +95,9 @@ struct ReplayFlags {
   // IP port to listen on for debug connections.
   int dbg_port;
 
+  // IP host to listen on for debug connections.
+  string dbg_host;
+
   // Whether to keep listening with a new server after the existing server
   // detaches
   bool keep_listening;
@@ -111,9 +111,15 @@ struct ReplayFlags {
   /* When true, echo tracee stdout/stderr writes to console. */
   bool redirect;
 
+  /* When true, do not bind to the CPU stored in the trace file. */
+  bool cpu_unbound;
+
   // When true make all private mappings shared with the tracee by default
   // to test the corresponding code.
   bool share_private_mappings;
+
+  // When nonzero, display statistics every N steps.
+  uint32_t dump_interval;
 
   ReplayFlags()
       : goto_event(0),
@@ -122,10 +128,13 @@ struct ReplayFlags {
         process_created_how(CREATED_NONE),
         dont_launch_debugger(false),
         dbg_port(-1),
+        dbg_host(localhost_addr),
         keep_listening(false),
         gdb_binary_file_path("gdb"),
         redirect(true),
-        share_private_mappings(false) {}
+        cpu_unbound(false),
+        share_private_mappings(false),
+        dump_interval(0) {}
 };
 
 static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
@@ -142,11 +151,14 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     { 'o', "debugger-option", HAS_PARAMETER },
     { 'p', "onprocess", HAS_PARAMETER },
     { 'q', "no-redirect-output", NO_PARAMETER },
+    { 'h', "dbghost", HAS_PARAMETER },
     { 's', "dbgport", HAS_PARAMETER },
     { 't', "trace", HAS_PARAMETER },
     { 'x', "gdb-x", HAS_PARAMETER },
     { 0, "share-private-mappings", NO_PARAMETER },
     { 1, "fullname", NO_PARAMETER },
+    { 2, "stats", HAS_PARAMETER },
+    { 'u', "cpu-unbound", NO_PARAMETER },
     { 'i', "interpreter", HAS_PARAMETER }
   };
   ParsedOption opt;
@@ -195,6 +207,10 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
     case 'q':
       flags.redirect = false;
       break;
+    case 'h':
+      flags.dbg_host = opt.value;
+      flags.dont_launch_debugger = true;
+      break;
     case 's':
       if (!opt.verify_valid_int(0, INT32_MAX)) {
         return false;
@@ -217,6 +233,15 @@ static bool parse_replay_arg(vector<string>& args, ReplayFlags& flags) {
       break;
     case 1:
       flags.gdb_options.push_back("--fullname");
+      break;
+    case 2:
+      if (!opt.verify_valid_int(1, INT32_MAX)) {
+        return false;
+      }
+      flags.dump_interval = opt.int_value;
+      break;
+    case 'u':
+      flags.cpu_unbound = true;
       break;
     case 'i':
       flags.gdb_options.push_back("-i");
@@ -290,6 +315,7 @@ static ReplaySession::Flags session_flags(const ReplayFlags& flags) {
   ReplaySession::Flags result;
   result.redirect_stdio = flags.redirect;
   result.share_private_mappings = flags.share_private_mappings;
+  result.cpu_unbound = flags.cpu_unbound;
   return result;
 }
 
@@ -299,10 +325,11 @@ static uint64_t to_microseconds(const struct timeval& tv) {
 
 static void serve_replay_no_debugger(const string& trace_dir,
                                      const ReplayFlags& flags) {
-  ReplaySession::shr_ptr replay_session = ReplaySession::create(trace_dir);
-  replay_session->set_flags(session_flags(flags));
+  ReplaySession::shr_ptr replay_session =
+    ReplaySession::create(trace_dir, session_flags(flags));
   uint32_t step_count = 0;
   struct timeval last_dump_time;
+  double last_dump_rectime = 0;
   Session::Statistics last_stats;
   gettimeofday(&last_dump_time, NULL);
 
@@ -323,21 +350,28 @@ static void serve_replay_no_debugger(const string& trace_dir,
     auto result = replay_session->replay_step(cmd);
     FrameTime after_time = replay_session->trace_reader().time();
     DEBUG_ASSERT(after_time >= before_time && after_time <= before_time + 1);
+    if (!last_dump_rectime)
+      last_dump_rectime = replay_session->trace_reader().recording_time();
 
     ++step_count;
-    if (DUMP_STATS_PERIOD > 0 && step_count % DUMP_STATS_PERIOD == 0) {
+    if (flags.dump_interval > 0 && step_count % flags.dump_interval == 0) {
       struct timeval now;
       gettimeofday(&now, NULL);
+      double rectime = replay_session->trace_reader().recording_time();
+      uint64_t elapsed_usec = to_microseconds(now) - to_microseconds(last_dump_time);
       Session::Statistics stats = replay_session->statistics();
-      printf(
+      fprintf(stderr,
           "[ReplayStatistics] ticks %lld syscalls %lld bytes_written %lld "
-          "microseconds %lld\n",
+          "microseconds %lld %%realtime %.0f%%\n",
           (long long)(stats.ticks_processed - last_stats.ticks_processed),
           (long long)(stats.syscalls_performed - last_stats.syscalls_performed),
           (long long)(stats.bytes_written - last_stats.bytes_written),
-          (long long)(to_microseconds(now) - to_microseconds(last_dump_time)));
+          (long long)elapsed_usec,
+          100.0 * ((rectime - last_dump_rectime) * 1.0e6) / (double)elapsed_usec
+        );
       last_dump_time = now;
       last_stats = stats;
+      last_dump_rectime = rectime;
     }
 
     if (result.status == REPLAY_EXITED) {
@@ -403,12 +437,13 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
     if (target.event == numeric_limits<decltype(target.event)>::max()) {
       serve_replay_no_debugger(trace_dir, flags);
     } else {
-      auto session = ReplaySession::create(trace_dir);
+      auto session = ReplaySession::create(trace_dir, session_flags(flags));
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
+      conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_name = flags.gdb_binary_file_path;
       conn_flags.keep_listening = flags.keep_listening;
-      GdbServer(session, session_flags(flags), target).serve_replay(conn_flags);
+      GdbServer(session, target).serve_replay(conn_flags);
     }
 
     // Everything should have been cleaned up by now.
@@ -429,11 +464,12 @@ static int replay(const string& trace_dir, const ReplayFlags& flags) {
       prctl(PR_SET_PDEATHSIG, SIGTERM, 0, 0, 0);
 
       ScopedFd debugger_params_write_pipe(debugger_params_pipe[1]);
-      auto session = ReplaySession::create(trace_dir);
+      auto session = ReplaySession::create(trace_dir, session_flags(flags));
       GdbServer::ConnectionFlags conn_flags;
       conn_flags.dbg_port = flags.dbg_port;
+      conn_flags.dbg_host = flags.dbg_host;
       conn_flags.debugger_params_write_pipe = &debugger_params_write_pipe;
-      GdbServer server(session, session_flags(flags), target);
+      GdbServer server(session, target);
 
       server_ptr = &server;
       struct sigaction sa;
@@ -536,6 +572,11 @@ int ReplayCommand::run(vector<string>& args) {
               flags.target_process);
       return 2;
     }
+  }
+  if (flags.dump_interval > 0 && !flags.dont_launch_debugger) {
+    fprintf(stderr, "--stats requires -a\n");
+    print_help(stderr);
+    return 2;
   }
 
   assert_prerequisites();

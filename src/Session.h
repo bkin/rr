@@ -24,7 +24,7 @@ class RecordSession;
 class ReplaySession;
 class ReplayTask;
 class Task;
-class TaskGroup;
+class ThreadGroup;
 class AutoRemoteSyscalls;
 
 // The following types are used by step() APIs in Session subclasses.
@@ -70,8 +70,8 @@ struct BreakStatus {
   std::vector<WatchConfig> watchpoints_hit;
   // When non-null, we stopped because a signal was delivered to |task|.
   std::unique_ptr<siginfo_t> signal;
-  // True when we stopped because we hit a breakpoint at |task|'s current
-  // ip().
+  // True when we stopped because we hit a software breakpoint at |task|'s
+  // current ip().
   bool breakpoint_hit;
   // True when we stopped because a singlestep completed in |task|.
   bool singlestep_complete;
@@ -80,6 +80,29 @@ struct BreakStatus {
   bool approaching_ticks_target;
   // True when we stopped because |task| is about to exit.
   bool task_exit;
+
+  // True when we stopped because we hit a software or hardware breakpoint at
+  // |task|'s current ip().
+  bool hardware_or_software_breakpoint_hit() {
+    for (const auto& w : watchpoints_hit) {
+      // Hardware execution watchpoints behave like breakpoints: the CPU
+      // stops before the instruction is executed.
+      if (w.type == WATCH_EXEC) {
+        return true;
+      }
+    }
+    return breakpoint_hit;
+  }
+  // Returns just the data watchpoints hit.
+  std::vector<WatchConfig> data_watchpoints_hit() {
+    std::vector<WatchConfig> result;
+    for (const auto& w : watchpoints_hit) {
+      if (w.type != WATCH_EXEC) {
+        result.push_back(w);
+      }
+    }
+    return result;
+  }
 
   bool any_break() {
     return !watchpoints_hit.empty() || signal || breakpoint_hit ||
@@ -115,13 +138,13 @@ class Session {
   friend class ReplaySession;
 
 public:
-  // AddressSpaces and TaskGroups are indexed by their first task's TaskUid
+  // AddressSpaces and ThreadGroups are indexed by their first task's TaskUid
   // (effectively), so that if the first task dies and its tid is recycled,
   // we don't get confused. TaskMap is indexed by tid since there can never be
   // two Tasks with the same tid at the same time.
   typedef std::map<AddressSpaceUid, AddressSpace*> AddressSpaceMap;
   typedef std::map<pid_t, Task*> TaskMap;
-  typedef std::map<TaskGroupUid, TaskGroup*> TaskGroupMap;
+  typedef std::map<ThreadGroupUid, ThreadGroup*> ThreadGroupMap;
 
   /**
    * Call |post_exec()| immediately after a tracee has successfully
@@ -159,12 +182,14 @@ public:
    */
   std::shared_ptr<AddressSpace> clone(Task* t,
                                       std::shared_ptr<AddressSpace> vm);
-
-  std::shared_ptr<TaskGroup> create_tg(Task* t);
+  /**
+   * Create the initial thread group.
+   */
+  std::shared_ptr<ThreadGroup> create_initial_tg(Task* t);
   /**
    * Return a copy of |tg| with the same mappings.
    */
-  std::shared_ptr<TaskGroup> clone(Task* t, std::shared_ptr<TaskGroup> tg);
+  std::shared_ptr<ThreadGroup> clone(Task* t, std::shared_ptr<ThreadGroup> tg);
 
   /** See Task::clone(). */
   Task* clone(Task* p, int flags, remote_ptr<void> stack, remote_ptr<void> tls,
@@ -182,10 +207,15 @@ public:
   Task* find_task(const TaskUid& tuid) const;
 
   /**
-   * Return the task group whose unique ID is |tguid|, or nullptr if no such
-   * task group exists.
+   * Return the thread group whose unique ID is |tguid|, or nullptr if no such
+   * thread group exists.
    */
-  TaskGroup* find_task_group(const TaskGroupUid& tguid) const;
+  ThreadGroup* find_thread_group(const ThreadGroupUid& tguid) const;
+
+  /**
+   * Find the thread group for a specific pid
+   */
+  ThreadGroup* find_thread_group(pid_t pid) const;
 
   /**
    * Return the AddressSpace whose unique ID is |vmuid|, or nullptr if no such
@@ -205,8 +235,8 @@ public:
    */
   void on_destroy(AddressSpace* vm);
   virtual void on_destroy(Task* t);
-  void on_create(TaskGroup* tg);
-  void on_destroy(TaskGroup* tg);
+  void on_create(ThreadGroup* tg);
+  void on_destroy(ThreadGroup* tg);
 
   /** Return the set of Tasks being traced in this session. */
   const TaskMap& tasks() const {
@@ -289,9 +319,17 @@ public:
   PtraceSyscallBeforeSeccomp syscall_seccomp_ordering() {
     return syscall_seccomp_ordering_;
   }
-  bool has_cpuid_faulting() const { return has_cpuid_faulting_; }
 
+  static bool has_cpuid_faulting();
   static const char* rr_mapping_prefix();
+
+  ScopedFd& tracee_socket_fd() { return *tracee_socket; }
+  int tracee_fd_number() const { return tracee_socket_fd_number; }
+
+  virtual TraceStream* trace_stream() { return nullptr; }
+  TicksSemantics ticks_semantics() const { return ticks_semantics_; }
+
+  virtual int cpu_binding(TraceStream& trace) const;
 
 protected:
   Session();
@@ -318,7 +356,7 @@ protected:
 
   AddressSpaceMap vm_map;
   TaskMap task_map;
-  TaskGroupMap task_group_map;
+  ThreadGroupMap thread_group_map;
 
   // If non-null, data required to finish initializing the tasks of this
   // session.
@@ -326,10 +364,14 @@ protected:
 
   Statistics statistics_;
 
+  std::shared_ptr<ScopedFd> tracee_socket;
+  int tracee_socket_fd_number;
   uint32_t next_task_serial_;
   ScopedFd spawned_task_error_fd_;
 
   PtraceSyscallBeforeSeccomp syscall_seccomp_ordering_;
+
+  TicksSemantics ticks_semantics_;
 
   /**
    * True if we've done an exec so tracees are now in a state that will be
@@ -341,11 +383,6 @@ protected:
    * True while the execution of this session is visible to users.
    */
   bool visible_execution_;
-
-  /**
-   * True if ARCH_GET/SET_CPUID are supported on this system.
-   */
-  bool has_cpuid_faulting_;
 };
 
 } // namespace rr

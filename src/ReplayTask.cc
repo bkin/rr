@@ -38,7 +38,7 @@ void ReplayTask::init_buffers_arch(remote_ptr<void> map_hint) {
     init_syscall_buffer(remote, map_hint);
     desched_fd_child = args.desched_counter_fd;
     // Prevent the child from closing this fd
-    fds->add_monitor(desched_fd_child, new PreserveFileMonitor());
+    fds->add_monitor(this, desched_fd_child, new PreserveFileMonitor());
 
     // Skip mmap record. It exists mainly to inform non-replay code
     // (e.g. RemixModule) that this memory will be mapped.
@@ -58,7 +58,7 @@ void ReplayTask::init_buffers_arch(remote_ptr<void> map_hint) {
         ASSERT(this, ret == cloned_file_data_fd_child);
         remote.infallible_syscall(syscall_number_for_close(arch()), fd);
       }
-      fds->add_monitor(cloned_file_data_fd_child, new PreserveFileMonitor());
+      fds->add_monitor(this, cloned_file_data_fd_child, new PreserveFileMonitor());
     }
   }
 
@@ -157,6 +157,21 @@ void ReplayTask::set_real_tid_and_update_serial(pid_t tid) {
   hpc.set_tid(tid);
   this->tid = tid;
   serial = session().next_task_serial();
+}
+
+bool ReplayTask::post_vm_clone(CloneReason reason, int flags, Task* origin) {
+  if (Task::post_vm_clone(reason, flags, origin) &&
+      reason == TRACEE_CLONE &&
+      trace_reader().preload_thread_locals_recorded()) {
+    // Consume the mapping.
+    TraceReader::MappedData data;
+    KernelMapping km = trace_reader().read_mapped_region(&data);
+    ASSERT(this, km.start() == AddressSpace::preload_thread_locals_start() &&
+           km.size() == PAGE_SIZE);
+    return true;
+  }
+
+  return false;
 }
 
 } // namespace rr

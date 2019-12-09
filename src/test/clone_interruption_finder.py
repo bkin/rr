@@ -14,4 +14,4 @@ while True:
         if m:
             futex_time = m.group(1)
 
-print futex_time
+print(futex_time)
