@@ -707,6 +707,9 @@ static int sources(const map<string, string>& binary_file_names, const map<strin
     bool has_source_files;
     LOG(debug) << "Looking for comp_dir substitutions for " << original_name;
     auto it = comp_dir_substitutions.find(original_name);
+    if (it == comp_dir_substitutions.end()) {
+      it = comp_dir_substitutions.find("DEFAULT");
+    }
     if (it != comp_dir_substitutions.end()) {
       LOG(debug) << "\tFound comp_dir substitution " << it->second;
       output_comp_dir_substitutions.push_back({ trace_relative_name, it->second });
